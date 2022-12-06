@@ -62,18 +62,18 @@ if ref_exist == 1:
    
 # delete the temp_tarholder directory since everything we need has been taken out of it
 for file_name in os.listdir('.'):
-    print(str(file_name))
     # construct full file path
-    path = os.getcwd()
-    file = path + '/' + file_name
+    fpath = os.getcwd()
+    file = fpath + '/' + file_name
     if os.path.isfile(file):
-        print('yes')
-        print('Deleting file:', file)
         os.remove(file)
 
 os.rmdir(os.getcwd())
    
-    
+################################################################  
 
+test = np.array([1,2,3,4])
+
+print(np.where(test[1:]<3))
 
     
