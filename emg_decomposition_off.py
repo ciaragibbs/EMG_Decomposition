@@ -1,11 +1,12 @@
-import glob, os
+import glob, os, scipy
 import xml.etree.ElementTree as ET
 import tarfile as tf
 import numpy as np
 import matplotlib.pyplot as plt
-from processing_tools import notch_filter, bandpass_filter
+from processing_tools import notch_filter, bandpass_filter, extend_emg, whiten_emg, fixed_point_alg, get_spikes, min_cov_isi, get_silohuette, peel_off
 import tkinter as tk
 from tkinter import simpledialog
+from scipy import signal
 ROOT = tk.Tk()
 ROOT.withdraw()
 
@@ -103,6 +104,7 @@ class preprocess_EMG(EMG):
         os.rmdir(os.getcwd())
 
         self.signal_dict = signal
+        self.decomp_dict = {}
         return
         
     def grid_formatter(self):
@@ -286,6 +288,7 @@ class preprocess_EMG(EMG):
                 batch [(i+1)*2-1] = plateau[0] + (i+1)*wind_len
 
             self.plateau_coords = batch
+            
         elif self.windows >= 1 and discontinuity: 
            
             prebatch = np.zeros([len(discontinuity)+1,2])
@@ -309,6 +312,7 @@ class preprocess_EMG(EMG):
 
             batch = np.sort(batch.reshape([1, np.shape(batch)[0]*np.shape(batch)[1]]))
             self.plateau_coords = batch
+            
         else:
             # the last option is having only one window and no discontinuity in the plateau; in that case, you leave as is
             batch = [plateau[0],plateau[-1]]
@@ -319,13 +323,15 @@ class preprocess_EMG(EMG):
         self.chans_per_grid = chans_per_grid
         # self.signal_dict['batched_data'] = np.zeros([int(self.signal_dict['ngrids']),int(len(self.plateau_coords)/2),int(chans_per_grid),int(wind_len)]) # 4D array: no.grids x no.windows x no.channels x window length
         self.signal_dict['batched_data'] = []
-
+        tracker = 0
         for i in range(int(self.signal_dict['ngrids'])):
             for interval in range (int(len(self.plateau_coords)/2)):
                 
                 grid = i + 1 
                 self.signal_dict['batched_data'].append(np.delete(self.signal_dict['data'][chans_per_grid*(grid-1):grid*chans_per_grid,int(self.plateau_coords[interval*2]):int(self.plateau_coords[(interval+1)*2-1])+1],self.rejected_channels[i,:] == 1,0))
-        
+                
+                tracker = tracker + 1
+            
 
     def batch_wo_target(self):
 
@@ -357,28 +363,137 @@ class preprocess_EMG(EMG):
 
                        
 
-    def convul_sphering(self):
+    def convul_sphering(self,g,interval,tracker):
 
         """ 1) Filter the batched EMG data 2) Extend to improve speed of convergence/reduce numerical instability 3) Remove any DC component  4) Whiten """
         chans_per_grid = self.chans_per_grid
-        tracker = 0
-        for i in range(int(self.signal_dict['ngrids'])):
-            for interval in range (int(len(self.plateau_coords)/2)):
+        grid = g+1
+        self.signal_dict['batched_data'][tracker]= notch_filter(self.signal_dict['batched_data'][tracker],self.signal_dict['fsamp'])
+        self.signal_dict['batched_data'][tracker] = bandpass_filter(self.signal_dict['batched_data'][tracker],self.signal_dict['fsamp'])  
 
-                grid = i+1
-                # notch filtering 
-               
-                self.signal_dict['batched_data'][tracker][0:][0:]= notch_filter(self.signal_dict['batched_data'][tracker][0:][0:],self.signal_dict['fsamp'])
-                # bandpass filtering
-                self.signal_dict['batched_data'][tracker][0:][0:] = bandpass_filter(self.signal_dict['batched_data'][tracker][0:][0:],self.signal_dict['fsamp'])  
-                
+        # differentiation - typical EMG generation model treats low amplitude spikes/MUs as noise, which is common across channels so can be cancelled with a first order difference. Useful for high intensities - where cross talk has biggest impact.
+        if self.differential_mode:
+            
+            to_shift = self.signal_dict['batched_data'][tracker]
+            self.signal_dict['batched_data'][tracker]= []
+            self.signal_dict['batched_data'][tracker]= np.diff(to_shift,n=1,axis=-1)
 
-                if self.differential_mode:
-                    print('To be completed')
-
-                tracker = tracker + 1
+        # processing is single grid, but all windows from here onwards
+            
+        # signal extension - increasing the number of channels to 1000
+        # Holobar 2007 -  Multichannel Blind Source Separation using Convolutive Kernel Compensation (describes matrix extension)
+        extension_factor = int(np.round(self.ext_factor/np.shape(self.signal_dict['batched_data'][tracker][0:])[0]))
+        self.signal_dict['extend_obvs'].append(np.zeros([np.shape(self.signal_dict['batched_data'][tracker][0:])[0]*(extension_factor), np.shape(self.signal_dict['batched_data'][tracker][0:])[1] + extension_factor -1 ]))
+        self.signal_dict['extend_obvs'][interval] = extend_emg(self.signal_dict['extend_obvs'][interval], self.signal_dict['batched_data'][tracker][0:], extension_factor)
+        self.signal_dict['sq_extend_obvs'].append(self.signal_dict['extend_obvs'][interval]@np.transpose(self.signal_dict['extend_obvs'][interval]) / np.shape(self.signal_dict['extend_obvs'][interval])[1])
+        self.signal_dict['inv_extend_obvs'].append(np.linalg.pinv(self.signal_dict['sq_extend_obvs'][interval]))
+        # de-mean the extended emg observation matrix
+        self.signal_dict['extend_obvs'][interval] = scipy.signal.detrend(self.signal_dict['extend_obvs'][interval], axis=- 1, type='constant', bp=0)
+        # whiten the signal + impose whitened extended observation matrix has a covariance matrix equal to the identity for time lag zero
+        self.decomp_dict['whitened_obvs'].append(whiten_emg(self.signal_dict['extend_obvs'][interval]))
         
-        print(self.signal_dict['batched_data'][3][0][0:10])
+        # remove the edges
+        self.signal_dict['extend_obvs'][interval] = self.signal_dict['extend_obvs'][interval][:,int(np.round(self.signal_dict['fsamp']*0.5)-1):-int(np.round(self.signal_dict['fsamp']*0.5))]
+        self.decomp_dict['whitened_obvs'][interval] = self.decomp_dict['whitened_obvs'][interval][:,int(np.round(self.signal_dict['fsamp']*0.5)-1):-int(np.round(self.signal_dict['fsamp']*0.5))]
+        
+        if g == 0: # don't need to repeat for every grid, since the path and target info (informing the batches), is the same for all grids
+            self.plateau_coords[interval*2] = self.plateau_coords[interval*2]  + int(np.round(self.signal_dict['fsamp']*0.5)) - 1
+            self.plateau_coords[(interval+1)*2 - 1] = self.plateau_coords[(interval+1)*2-1]  - int(np.round(self.signal_dict['fsamp']*0.5))
+           
+
+
+
+######################### FAST ICA AND CONVOLUTIVE KERNEL COMPENSATION  ############################################
+####################################################################################################################
+
+    def fast_ICA_and_CKC(self,g,interval,tracker):
+
+        # initialise zero arrays for separation matrix B and separation vectors w
+        self.decomp_dict['B_sep_mat'] = np.zeros([np.shape(self.decomp_dict['whitened_obvs'][interval])[0],self.its])
+        self.decomp_dict['w_sep_vect'] = np.zeros([np.shape(self.decomp_dict['whitened_obvs'][interval])[0],1])
+        self.decomp_dict['MU_filters'] = np.zeros([int(len(self.plateau_coords)/2),np.shape(self.decomp_dict['whitened_obvs'][interval])[0],self.its])
+        self.decomp_dict['SILs'] = np.zeros([int(len(self.plateau_coords)/2),self.its])
+        init_its = np.zeros([self.its],dtype=int) # tracker of initialisaitons of separation vectors across iterations
+        fpa_its = 500 # maximum number of iterations for the fixed point algorithm
+        
+        # identify the time instant at which the maximum of the squared summation of all whitened extended observation vectors
+        # occurs. Then, project vector is initialised to the whitened observation vector, at this located time instant.
+        Z = self.decomp_dict['whitened_obvs'][interval]
+        sort_sq_sum_Z = np.squeeze(np.argsort(np.square(np.sum(Z, axis = 0))))
+        # create a time axis for spiking activity
+        time_axis = np.linspace(0,np.shape(Z)[1],np.shape(Z)[1])/self.signal_dict['fsamp']
+        print(np.shape(time_axis))
+        for i in range(self.its):
+
+                print(i)
+
+                #################### FIXED POINT ALGORITHM #################################
+
+                init_its[i] = sort_sq_sum_Z[-(i+1)] # since the indexing starts at -1 the other way (for ascending order list)
+                self.decomp_dict['w_sep_vect'] = Z[:,int(init_its[i])] # retrieve the corresponding signal value to initialise the separation vector
+                # orthogonalise separation vector before fixed point algorithm
+                self.decomp_dict['w_sep_vect'] = self.decomp_dict['w_sep_vect'] - self.decomp_dict['B_sep_mat'] @ np.transpose(self.decomp_dict['B_sep_mat']) @ self.decomp_dict['w_sep_vect'] 
+                # normalise separation vector before fixed point algorithm 
+                self.decomp_dict['w_sep_vect'] = self.decomp_dict['w_sep_vect']/np.linalg.norm(self.decomp_dict['w_sep_vect'])
+                
+                # use the fixed point algorithm to identify consecutive separation vectors
+                self.decomp_dict['w_sep_vect'] = fixed_point_alg(self.decomp_dict['w_sep_vect'],self.decomp_dict['B_sep_mat'],Z,fpa_its)
+                ### to do ### need to give option at beginning to choose contrast function, for now it is squared unless stated otherwise
+                fICA_source, spikes = get_spikes(self.decomp_dict['w_sep_vect'],Z, self.signal_dict['fsamp'])
+                
+                ################# MINIMISATION OF COV OF DISCHARGES ############################
+
+                if len(spikes) > 10:
+
+                    # determine the interspike interval
+                    ISI = np.diff(spikes/self.signal_dict['fsamp'])
+                    # determine the coefficient of variation
+                    CoV = np.std(ISI)/np.mean(ISI)
+                    # update the sepearation vector by summing all the spikes
+                    w_n_p1 = np.sum(Z[:,spikes],axis=1) # summing the spiking across time, leaving an array that is channels x 1 
+                    # minimisation of covariance of interspike intervals
+                    self.decomp_dict['MU_filters'][interval][:,i], spikes = min_cov_isi(w_n_p1,self.decomp_dict['B_sep_mat'],Z, self.signal_dict['fsamp'],CoV,spikes)
+                    self.decomp_dict['B_sep_mat'][:,i] = np.squeeze(self.decomp_dict['w_sep_vect']).real 
+                    # had to make it have a second dimension of 1 for matrix multiplication, so squeeze now to remove for storage
+                    # also .real since it has 0js atm
+
+                    # calculate SIL
+                    fICA_source, spikes, self.decomp_dict['SILs'][interval,i] = get_silohuette(self.decomp_dict['MU_filters'][interval][:,i],Z,self.signal_dict['fsamp'])
+                    # peel off
+                    if self.peel_off == 0 and self.decomp_dict['SILs'][interval,i] > self.sil_thr:
+                        Z = peel_off(Z, spikes, self.signal_dict['fsamp'])
+                        
+
+            
+                    if self.drawing_mode == 1:
+                        plt.clf()
+                        plt.ion()
+                        plt.show()
+                        plt.subplot(2, 1, 1)
+                        plt.plot(self.signal_dict['target'], 'k--', linewidth=2)
+                        plt.plot([self.plateau_coords[interval*2], self.plateau_coords[interval*2]], [0, max(self.signal_dict['target'])], color='r', linewidth=2)
+                        plt.plot([self.plateau_coords[(interval+1)*2 - 1], self.plateau_coords[(interval+1)*2 - 1]], [0, max(self.signal_dict['target'])], color='r', linewidth=2)
+                        plt.title('Grid #{} - Iteration #{} - Sil = {}'.format(g, i, self.decomp_dict['SILs'][interval,i]))
+                        plt.subplot(2, 1, 2)
+                        plt.plot(time_axis, fICA_source,linewidth = 0.75)
+                        plt.plot(time_axis[spikes],fICA_source[spikes],'o')
+                        plt.grid()
+                        plt.draw()
+                        plt.pause(0.001)
+                    else:
+                        print('Grid #{} - Iteration #{} - Sil = {}'.format(g, i, self.decomp_dict['SILs'][interval,i]))
+
+
+                else:
+                    # without enough spikes, we skip minimising the covariation of discharges to improve the separation vector
+                    self.decomp_dict['B_sep_mat'][:,i] = np.squeeze(self.decomp_dict['w_sep_vect']).real 
+
+
+    def post_process_EMG():
+
+        print('to be completed')
+            
+        
 
 
 
