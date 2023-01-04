@@ -1,3 +1,4 @@
+
 from emg_decomposition_off import EMG, preprocess_EMG
 import glob, os
 import numpy as np
@@ -32,7 +33,7 @@ for i in range(len(all_files)):
     for g in range(int(emg_obj.signal_dict['ngrids'])):
 
             emg_obj.signal_dict['extend_obvs'] = []
-            emg_obj.signal_dict['sq_extend_obvs'] = []
+            emg_obj.signal_dict['sq_extend_obvs'] = []   
             emg_obj.signal_dict['inv_extend_obvs'] = []
             emg_obj.decomp_dict['whitened_obvs'] = []
 

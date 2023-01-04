@@ -7,8 +7,7 @@ from processing_tools import notch_filter, bandpass_filter, extend_emg, whiten_e
 import tkinter as tk
 from tkinter import simpledialog
 from scipy import signal
-ROOT = tk.Tk()
-ROOT.withdraw()
+root = tk.Tk()
 
 
 class EMG():
@@ -35,21 +34,21 @@ class preprocess_EMG(EMG):
     # child class of EMG, so will inherit it's initialisaiton
     
     def open_otb(self,inputfile):
-        
-        """ Open the otb+ file and store signal data into a dictionary"""
 
         file_name = inputfile.split('/')[1]
-        with tf.open(file_name,'r') as emg_tar: # later change so all otb+ file names are extracted with glob.glob
-            # make a temporary directory to store the data of the otb file if it doesn't exist yet
-            if not os.path.isdir('temp_tarholder'):
-                os.mkdir('temp_tarholder')
+        temp_dir = os.path.join('.', 'temp_tarholder')
+        # make a temporary directory to store the data of the otb file if it doesn't exist yet
+        if not os.path.isdir(temp_dir):
+            os.mkdir(temp_dir)
 
-            # extract all the tar/otb+ files and store in temp_tarholder
-            emg_tar.extractall('./temp_tarholder')
-            os.getcwd()
-            os.chdir('./temp_tarholder')
-            trial_label_sig = glob.glob('./*.sig')[0] # only one .sig so can be used to get the trial name (0 index list->string)
-            trial_label_xml = trial_label_sig.split('/')[1].split('.')[0] + '.xml'
+        # Open the .tar file and extract all data
+        with tf.open(inputfile, 'r') as emg_tar:
+            emg_tar.extractall(temp_dir)
+
+        os.chdir(temp_dir)
+        sig_files = [f for f in os.listdir('.') if f.endswith('.sig')]
+        trial_label_sig = sig_files[0]  # only one .sig so can be used to get the trial name (0 index list->string)
+        trial_label_xml = trial_label_sig.split('.')[0] + '.xml'
 
         # read the contents of the trial xml file
         with open(trial_label_xml,encoding='utf-8') as file:
@@ -70,7 +69,7 @@ class preprocess_EMG(EMG):
 
         # convert the data from bits to microvolts
         for i in range(nchans):
-            emg_data[i,:] = ((emg_data[i,:]*5000)/(2**float(nADbit)))
+            emg_data[i,:] = ((np.dot(emg_data[i,:],5000))/(2**float(nADbit))) # np.dot is faster than *
 
         # create a dictionary containing all relevant signal parameters and data
         signal = dict(data = emg_data, fsamp = fsamp, nchans = nchans, ngrids = ngrids,grids = grid_names[:ngrids],muscles = muscle_names[:ngrids]) # discard the other muscle and grid entries, not relevant
@@ -207,18 +206,18 @@ class preprocess_EMG(EMG):
                 rejected_channels = np.zeros([self.signal_dict['ngrids'],40]);
                 IED = 1
             
+            ElChannelMap = np.array(ElChannelMap)
             chans_per_grid = (np.shape(ElChannelMap)[0] * np.shape(ElChannelMap)[1]) - 1
             coordinates = np.zeros([chans_per_grid,2])
-            
-            for r in range(np.shape(ElChannelMap)[0]):
-                for c in range(np.shape(ElChannelMap)[1]):
-
-                    coordinates[ElChannelMap[r][c],0] = r
-                    coordinates[ElChannelMap[r][c],1] = c
+            rows, cols = ElChannelMap.shape
+            row_indices, col_indices = np.unravel_index(np.arange(ElChannelMap.size), (rows, cols))
+            coordinates[:, 0] = row_indices[1:]
+            coordinates[:, 1] = col_indices[1:]
 
           
             c_map.append(np.shape(ElChannelMap)[1])
             r_map.append(np.shape(ElChannelMap)[0])
+            
             grid = i + 1 
             
             # notch filtering
@@ -231,6 +230,7 @@ class preprocess_EMG(EMG):
         self.rejected_channels = rejected_channels
         self.ied = IED
         self.coordinates = coordinates
+        
 
                     
     def manual_rejection(self):
@@ -246,16 +246,17 @@ class preprocess_EMG(EMG):
             
             for c in range(self.c_maps[i]):
                 
-                plt.figure(figsize=(10,8))
+                #plt.figure(figsize=(10,8))
                 for r in range(self.r_maps[i]):
 
                     num_chans2reject = []
                     if (c+r) > 0: # TO-DO: remove the assumption of the left corner channel being invalid
                         plt.plot(sig2inspect[(c*self.r_maps[i])+r-1,:]/max(sig2inspect[(c*self.r_maps[i])+r-1,:])+r+1)
+                plt.show()
                         
 
-                plt.show()
-
+                
+                
                 inputchannels = simpledialog.askstring(title="Channel Rejection",
                                   prompt="Please enter channel numbers to be rejected (1-13), input with spaces between numbers:")
                 print("The selected channels for rejection are:", inputchannels)
@@ -294,12 +295,12 @@ class preprocess_EMG(EMG):
             prebatch = np.zeros([len(discontinuity)+1,2])
             
             prebatch[0,:] = [plateau[0],plateau[discontinuity[0]]]
-            for i in range(len(discontinuity)):
-                
-                if i < len(discontinuity)-1:
-                    prebatch[i+1,:] = [plateau[discontinuity[i]+1],plateau[discontinuity[i+1]]] # starting from the right adjacent point of the discontinuity index stamp
+            n = len(discontinuity)
+            for i, d in enumerate(discontinuity):
+                if i < n - 1:
+                    prebatch[i+1,:] = [plateau[d+1],plateau[discontinuity[i+1]]]
                 else:
-                    prebatch[i+1,:] = [plateau[discontinuity[i]+1],plateau[-1]]
+                    prebatch[i+1,:] = [plateau[d+1],plateau[-1]]
 
             plat_len = prebatch[:,-1] - prebatch[:,0]
             wind_len = np.floor(plat_len/self.windows)
@@ -321,16 +322,22 @@ class preprocess_EMG(EMG):
         # with the markers for windows and plateau discontinuities, batch the emg data ready for decomposition
         chans_per_grid = (self.r_maps[i] * self.c_maps[i]) - 1
         self.chans_per_grid = chans_per_grid
-        # self.signal_dict['batched_data'] = np.zeros([int(self.signal_dict['ngrids']),int(len(self.plateau_coords)/2),int(chans_per_grid),int(wind_len)]) # 4D array: no.grids x no.windows x no.channels x window length
-        self.signal_dict['batched_data'] = []
         tracker = 0
+        n_intervals = (int(len(self.plateau_coords)/2))
+        batched_data = [None] * (self.signal_dict['ngrids'] * n_intervals)
+
         for i in range(int(self.signal_dict['ngrids'])):
-            for interval in range (int(len(self.plateau_coords)/2)):
+            
+            grid = i + 1
+            for interval in range(n_intervals):
                 
-                grid = i + 1 
-                self.signal_dict['batched_data'].append(np.delete(self.signal_dict['data'][chans_per_grid*(grid-1):grid*chans_per_grid,int(self.plateau_coords[interval*2]):int(self.plateau_coords[(interval+1)*2-1])+1],self.rejected_channels[i,:] == 1,0))
-                
-                tracker = tracker + 1
+                data_slice = self.signal_dict['data'][chans_per_grid*(grid-1):grid*chans_per_grid, int(self.plateau_coords[interval*2]):int(self.plateau_coords[(interval+1)*2-1])+1]
+                rejected_channels_slice = self.rejected_channels[i,:] == 1
+                # Remove rejected channels
+                batched_data[tracker] = np.delete(data_slice, rejected_channels_slice, 0)
+                tracker += 1
+
+        self.signal_dict['batched_data'] = batched_data
             
 
     def batch_wo_target(self):
@@ -344,16 +351,28 @@ class preprocess_EMG(EMG):
         self.plateau_coords = np.zeros([1,self.windows *2])
         chans_per_grid = (self.r_maps[i] * self.c_maps[i]) - 1
         self.chans_per_grid = chans_per_grid
+        tracker = 0
+        n_intervals = (int(len(self.plateau_coords)/2))
+        batched_data = [None] * (self.signal_dict['ngrids'] * n_intervals) 
+
         for interval in range(self.windows):
             
             self.plateau_coords[interval*2] = np.floor(window_clicks[interval*2][0])
             self.plateau_coords[(interval+1)*2-1] = np.floor(window_clicks[(interval+1)*2-1][0])
+        
+        
 
         for i in range(int(self.signal_dict['ngrids'])):
-            for interval in range (int(len(self.plateau_coords)/2)):
+
+            grid = i + 1
+            for interval in range(n_intervals):
                 
-                grid = i + 1 
-                self.signal_dict['batched_data'].append(np.delete(self.signal_dict['data'][chans_per_grid*(grid-1):grid*chans_per_grid,int(self.plateau_coords[interval*2]):int(self.plateau_coords[(interval+1)*2-1])+1],self.rejected_channels[i,:] == 1,0))
+                data_slice = self.signal_dict['data'][chans_per_grid*(grid-1):grid*chans_per_grid, int(self.plateau_coords[interval*2]):int(self.plateau_coords[(interval+1)*2-1])+1]
+                rejected_channels_slice = self.rejected_channels[i,:] == 1
+                batched_data[tracker] = np.delete(data_slice, rejected_channels_slice, 0)
+                tracker += 1
+        
+        self.signal_dict['batched_data'] = batched_data
 
 
 
@@ -422,17 +441,15 @@ class preprocess_EMG(EMG):
         sort_sq_sum_Z = np.squeeze(np.argsort(np.square(np.sum(Z, axis = 0))))
         # create a time axis for spiking activity
         time_axis = np.linspace(0,np.shape(Z)[1],np.shape(Z)[1])/self.signal_dict['fsamp']
-        print(np.shape(time_axis))
+      
         for i in range(self.its):
-
-                print(i)
 
                 #################### FIXED POINT ALGORITHM #################################
 
                 init_its[i] = sort_sq_sum_Z[-(i+1)] # since the indexing starts at -1 the other way (for ascending order list)
                 self.decomp_dict['w_sep_vect'] = Z[:,int(init_its[i])] # retrieve the corresponding signal value to initialise the separation vector
                 # orthogonalise separation vector before fixed point algorithm
-                self.decomp_dict['w_sep_vect'] = self.decomp_dict['w_sep_vect'] - self.decomp_dict['B_sep_mat'] @ np.transpose(self.decomp_dict['B_sep_mat']) @ self.decomp_dict['w_sep_vect'] 
+                self.decomp_dict['w_sep_vect'] = self.decomp_dict['w_sep_vect'] - np.dot(np.matmul(self.decomp_dict['B_sep_mat'],np.transpose(self.decomp_dict['B_sep_mat'])),self.decomp_dict['w_sep_vect'])
                 # normalise separation vector before fixed point algorithm 
                 self.decomp_dict['w_sep_vect'] = self.decomp_dict['w_sep_vect']/np.linalg.norm(self.decomp_dict['w_sep_vect'])
                 
@@ -460,7 +477,7 @@ class preprocess_EMG(EMG):
                     # calculate SIL
                     fICA_source, spikes, self.decomp_dict['SILs'][interval,i] = get_silohuette(self.decomp_dict['MU_filters'][interval][:,i],Z,self.signal_dict['fsamp'])
                     # peel off
-                    if self.peel_off == 0 and self.decomp_dict['SILs'][interval,i] > self.sil_thr:
+                    if self.peel_off == 1 and self.decomp_dict['SILs'][interval,i] > self.sil_thr:
                         Z = peel_off(Z, spikes, self.signal_dict['fsamp'])
                         
 
@@ -475,11 +492,11 @@ class preprocess_EMG(EMG):
                         plt.plot([self.plateau_coords[(interval+1)*2 - 1], self.plateau_coords[(interval+1)*2 - 1]], [0, max(self.signal_dict['target'])], color='r', linewidth=2)
                         plt.title('Grid #{} - Iteration #{} - Sil = {}'.format(g, i, self.decomp_dict['SILs'][interval,i]))
                         plt.subplot(2, 1, 2)
-                        plt.plot(time_axis, fICA_source,linewidth = 0.75)
+                        plt.plot(time_axis, fICA_source,linewidth = 0.5)
                         plt.plot(time_axis[spikes],fICA_source[spikes],'o')
                         plt.grid()
                         plt.draw()
-                        plt.pause(0.001)
+                        plt.pause(1e-6)
                     else:
                         print('Grid #{} - Iteration #{} - Sil = {}'.format(g, i, self.decomp_dict['SILs'][interval,i]))
 
@@ -493,7 +510,6 @@ class preprocess_EMG(EMG):
 
         print('to be completed')
             
-        
 
 
 

@@ -6,7 +6,7 @@ from scipy.fft import fft
 import matplotlib.pyplot as plt
 import sklearn 
 from sklearn.cluster import KMeans
-
+# @numba.jit
 ##################################### FILTERING TOOLS #######################################################
 
 def notch_filter(signal,fsamp,to_han = False):
@@ -60,7 +60,7 @@ def notch_filter(signal,fsamp,to_han = False):
         corrector = int(len(fourier_signal) - np.floor(len(fourier_signal)/2)*2)  # will either be 0 or 1 (0 if signal length is even, 1 if signal length is odd)
         # wrapping FT
         fourier_interf[int(np.ceil(len(fourier_signal)/2)):] = np.flip(np.conj(fourier_interf[1: int(np.ceil(len(fourier_signal)/2)+1- corrector)])) # not indexing first because this is 0Hz, not to be repeated
-        filtered_signal[chan,:] = signal[chan,:] - np.fft.ifft(fourier_interf)
+        filtered_signal[chan,:] = signal[chan,:] - np.fft.ifft(fourier_interf).real
       
 
     return filtered_signal
@@ -137,10 +137,11 @@ def whiten_emg(signal):
     evalues = evalues[evalues>hard_limit]
     diag_mat = np.diag(evalues)
     
-    
-    whitening_mat = evectors @ np.linalg.inv(np.sqrt(diag_mat)) @ np.transpose(evectors)
-    dewhitening_mat = evectors @ np.sqrt(diag_mat) @ np.transpose(evectors)
-    whitened_emg =  whitening_mat @ signal
+    # np.dot is faster than @, since it's derived from C-language
+    whitening_mat = np.dot(np.dot(evectors,np.linalg.inv(np.sqrt(diag_mat))),np.transpose(evectors))
+    dewhitening_mat = np.dot(np.dot(evectors,np.sqrt(diag_mat)),np.transpose(evectors))
+    whitened_emg =  np.dot(whitening_mat,signal).real 
+
     
     return whitened_emg
 
@@ -161,7 +162,7 @@ def skew(x):
     return x**3/3
 
 def exp(x):
-    return np.exp(-x**2/2)
+    return np.exp(-np.square(x)/2)
 
 def logcosh(x):
     return np.log(np.cosh(x))
@@ -170,42 +171,13 @@ def dot_square(x):
     return 2*x
 
 def dot_skew(x):
-    return 2*(x**2)/3
+    return 2*(np.square(x))/3
 
 def dot_exp(x):
-    return -1*(np.exp(-np.square(x)/2)) + (np.square(x)) @ np.exp(-np.square(x)/2)
+    return -1*(np.exp(-np.square(x)/2)) + np.dot((np.square(x)), np.exp(-np.square(x)/2))
 
 def dot_logcosh(x):
     return np.tanh(x)
-
-def fixed_point_alg(w_n, B, Z, its=500, cf='square'):
-    
-    if cf == 'square':
-        cf = square
-        dot_cf = dot_square
-    elif cf == 'skew':
-        cf = skew
-        dot_cf = dot_skew
-    elif cf == 'exp':
-        cf = exp
-        dot_cf = dot_exp
-    elif cf == 'logcosh':
-        cf = logcosh
-        dot_cf = dot_logcosh
-
-    w_n = np.expand_dims(w_n, axis=1)
-    B_T_B = B @ np.transpose(B)
-    its_tolerance_sq = its_tolerance ** 2
-
-    while True:
-        w_n_1 = w_n
-        A = dot_cf(np.dot(np.transpose(w_n_1), Z)).mean()
-        w_n = np.expand_dims((Z * cf(np.dot(np.transpose(w_n_1), Z))).mean(axis=1), axis=1) - A * w_n_1
-        w_n = w_n - B_T_B @ w_n
-        if (np.square(w_n - w_n_1)).sum() < its_tolerance_sq:
-            break
-
-    return w_n
 
 def fixed_point_alg(w_n, B, Z, its = 500, cf = 'square'):
 
@@ -221,24 +193,23 @@ def fixed_point_alg(w_n, B, Z, its = 500, cf = 'square'):
 
 
     if cf == 'square':
-        cf = lambda x: np.square(x)
-        dot_cf = lambda x: 2*x
+        cf = square
+        dot_cf = dot_square
     elif cf == 'skew':
-        cf = lambda x: x**3/3
-        dot_cf = lambda x: 2*(x**2)/3
+        cf = skew
+        dot_cf = dot_skew
     elif cf == 'exp':
-        cf = lambda x: np.exp(-x**2/2)
-        dot_cf = lambda x: -1*(np.exp(-np.square(x)/2)) + (np.square(x)) @ np.exp(-np.square(x)/2)
+        cf = exp
+        dot_cf = dot_exp
     elif cf == 'logcosh':
-        cf = lambda x: np.log(np.cosh(x))
-        dot_cf = lambda x: np.tanh(x)
-
-    
+        cf = logcosh
+        dot_cf = dot_logcosh
    
     counter = 0
     its_tolerance = 0.0001
     sep_diff = np.ones([its])
     w_n = np.expand_dims(w_n,axis=1)
+    B_T_B = np.matmul(B,np.transpose(B))
 
     while sep_diff[counter] > its_tolerance:
 
@@ -249,11 +220,13 @@ def fixed_point_alg(w_n, B, Z, its = 500, cf = 'square'):
         A =  dot_cf(np.dot(np.transpose(w_n_1), Z)).mean()
         w_n = np.expand_dims((Z*cf(np.dot(np.transpose(w_n_1), Z))).mean(axis=1),axis=1) - A * w_n_1
         # orthogonalise separation vectors
-        w_n = w_n - B @ np.transpose(B)@ w_n
+        w_n = w_n - np.dot(B_T_B,w_n)
         # normalise separation vectors
         w_n = w_n/np.linalg.norm(w_n)
         counter = counter + 1
-        sep_diff[counter] = abs(np.transpose(w_n) @ w_n_1 - 1)
+        sep_diff[counter] = abs(np.dot(np.transpose(w_n),w_n_1) - 1)
+        if counter >= its:
+            break
 
     return w_n
 
@@ -265,14 +238,14 @@ def get_spikes(w_n,Z, fsamp):
     vector estimate. Results in a reduction in ISI vairability (by seeking to minimise the covariation in MU discharges)"""
 
     # Step 4a: 
-    source_pred = np.square((np.transpose(w_n) @ Z)).real # element-wise square of the input to estimate the ith source
+    source_pred = np.square(np.dot(np.transpose(w_n),Z)).real # element-wise square of the input to estimate the ith source
     # Step 4b:
     peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = fsamp*0.01 ) # peaks variable holds the indices of all peaks
     if len(peaks) > 1:
 
         kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[:,peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
         spikes_ind = np.argmax(kmeans.cluster_centers_)
-        spikes = peaks[kmeans.labels_ == spikes_ind]
+        spikes = peaks[np.where(kmeans.labels_ == spikes_ind)]
 
     return source_pred, spikes
 
@@ -315,7 +288,7 @@ def min_cov_isi(w_n,B,Z,fsamp,cov_n,spikes_n):  #
 def get_silohuette(w_n,Z,fsamp):
 
     # Step 4a: 
-    source_pred = (np.transpose(w_n) @ Z).real # element-wise square of the input to estimate the ith source
+    source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
     source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     
     # Step 4b:
@@ -324,7 +297,7 @@ def get_silohuette(w_n,Z,fsamp):
 
         kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
         spikes_ind = np.argmax(kmeans.cluster_centers_)
-        spikes = peaks[kmeans.labels_ == spikes_ind]
+        spikes = peaks[np.where(kmeans.labels_ == spikes_ind)]
         sil = sklearn.metrics.silhouette_score(source_pred[peaks].reshape(-1,1), kmeans.labels_, metric='euclidean')
     else:
 
@@ -346,7 +319,7 @@ def peel_off(Z,spikes,fsamp):
         EMGtemp[i,:] =  np.convolve(firings, waveform, "same")
 
     Z = Z - EMGtemp; # removing the EMG representation of the source spearation vector from the signal, avoid picking up replicate content in future iterations
-
+    return Z
 ############################## POST PROCESSING #####################################################
 
 def cutMUAP(MUPulses, length, Y):
@@ -360,19 +333,154 @@ def cutMUAP(MUPulses, length, Y):
     Outputs:
     - MUAPs: row-wise matrix of extracted MUAPs (algined signal intervals of length 2*len+1)"""
  
-    while len(MUPulses) > 0 and MUPulses[len(MUPulses)-1] + 2 * length > len(Y):
+    while len(MUPulses) > 0 and MUPulses[-1] + 2 * length > len(Y):
         MUPulses = MUPulses[:-1]
 
     c = len(MUPulses)
     edge_len = round(length / 2)
     tmp = scipy.signal.windows.gaussian(2 * edge_len, std=edge_len / 3)
-    win = np.concatenate((tmp[:edge_len-1], np.ones(2 * length - 2 * edge_len + 1), tmp[edge_len-1:]))
+    win = np.concatenate((tmp[:edge_len], np.ones(2 * length - 2 * edge_len + 1), tmp[edge_len:]))
     MUAPs = np.zeros((c, 1 + 2 * length))
     for k in range(c):
-        start = max(MUPulses[k] - length-1, 1) - (MUPulses[k] - length-1)
-        end = MUPulses[k] + length - 1 - min(MUPulses[k] + length - 1, len(Y))
-        MUAPs[k, :] = win * np.concatenate((np.zeros(start), Y[max(MUPulses[k] - length - 1, 1):min(MUPulses[k] + length - 1, len(Y))], np.zeros(end)))
+        start = max(MUPulses[k] - length, 1) - (MUPulses[k] - length)
+        end = MUPulses[k] + length- min(MUPulses[k] + length, len(Y))
+        MUAPs[k, :] = win * np.concatenate((np.zeros(start), Y[max(MUPulses[k] - length, 1):min(MUPulses[k] + length, len(Y))+1], np.zeros(end)))
 
     return MUAPs
 
+
+
+def batch_process_filters(dewhit_mat, mu_filters,inv_extend_obvs,extend_obvs,plateau,exfactor,diff,orig_sig_size,fsamp):
+
+    """ dis_time: the distribution of spiking times for every identified motor unit, but at this point we don't check to see
+    whether any of these MUs are repeats"""
+
+    # Pulse trains has shape no_mus x original signal duration
+    # dewhitening matrix has shape no_windows x exten chans x exten chans
+    # mu filters has size no_windows x exten chans x (maximum of) x no iterations  --> less if iterations failed to reach SIL threshold
+
+    mu_count = 0
+    for win in range (np.shape(dewhit_mat)[1]):
+        mu_count += np.shape(mu_filters[win])[1]
+    
+    pulse_trains = np.zeros([mu_count, orig_sig_size]) 
+    discharge_times = [None] * mu_count
+    mu_batch_count = 0
+
+    for win_1 in range(np.shape(dewhit_mat)[1]):
+        for exchan in range(np.shape(mu_filters)[1]):
+            for win_2 in range(np.shape(dewhit_mat)[1]):
+
+                dewhit_filters = (np.matmul(dewhit_mat, mu_filters[win_1][:,exchan])).T
+                #pulse_trains[mu_batch_count, plateau[win_2*2]:plateau[(win_2+1)*2 - 1]+exfactor-1-diff] = np.matmul(np.matmul(dewhit_filters, iReSIG{nwin2}), eSIG{nwin2})
+
+            pulse_trains[mu_batch_count,:] = pulse_trains[mu_batch_count,:]/ np.max(pulse_trains[mu_batch_count,:])
+            pulse_trains[mu_batch_count,:] = np.multiply( pulse_trains[mu_batch_count,:],abs(pulse_trains[mu_batch_count,:])) 
+            peaks, _ = scipy.signal.find_peaks(np.squeeze(pulse_trains[mu_batch_count,:]), distance = np.round(fsamp*0.01) ) 
+            
+            kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(pulse_trains[mu_batch_count,peaks].reshape(-1,1)) 
+            spikes_ind = np.argmax(kmeans.cluster_centers_)
+            discharge_times[mu_count] = peaks[np.where(kmeans.labels_ == spikes_ind)] 
+            print(f"Batch processing MU#{mu_batch_count} out of {mu_count} MUs")
+            mu_batch_count += mu_batch_count
+    
+    return pulse_trains, discharge_times
+
+def xcorr(x,y):
+    norm_x = x/np.linalg.norm(x)
+    norm_y = y/np.linalg.norm(y)
+    corr = signal.correlate(x, y, mode="full")
+    lags = signal.correlation_lags(len(x), len(y), mode="full")
+    return lags, corr
+
+def remove_duplicates(pulse_trains, discharge_times, exfactor, tol = 0.3):
+
+    spike_trains = np.zeros([np.shape(pulse_trains)[0],np.shape(pulse_trains)[1]])
+    lag_limit = exfactor * 2
+    # Making binary spike trains for each established MU
+    for i in range(np.shape(pulse_trains)[0]):
+        spike_trains[i,discharge_times[i]] = 1
+    # With these binary trains, you can readily identify duplicate MUs
+    while discharge_times:
+        
+        temp_discharge_times = [None] * len(pulse_trains)
+        for mu in range(len(pulse_trains)):
+
+            lags, corr = xcorr(spike_trains[0,:], spike_trains[mu,:])
+            lim_lags = np.where(np.logical_and(lags>=-2*exfactor, lags<=2*exfactor))[0]
+            corr_max, ind_max = max(corr[lim_lags])
+
+            if corr_max > 0.2:
+                temp_discharge_times[mu] = temp_discharge_times[mu] + lags[ind_max]
+            else:
+                temp_discharge_times[mu] = temp_discharge_times[mu]
+
+        # Find common discharge times
+        common_discharges = np.zeros(len(pulse_trains))
+        for mu in range(1,len(pulse_trains)):
+
+            common_discharges[mu] = 1
+
+           
+
+def remove_outliers(pulse_trains, discharge_times, fsamp, max_its = 30):
+
+    for mu in range(np.shape(discharge_times)[0]):
+
+        # isn't this quite a coarse way of calculating firing rate? i.e. without any smoothing?
+        discharge_rates = 1/(np.diff(discharge_times[mu]) / fsamp)
+        while (np.std(discharge_rates)/np.mean(discharge_rates)) > 0.4 and it < max_its:
+
+            artifact_limit = np.mean(discharge_rates) + 3*np.std(discharge_rates)
+            # identify the indices for which this limit is exceeded
+            artifact_inds = np.squeeze(np.argwhere(discharge_rates > artifact_limit))
+            if len(artifact_inds) > 0:
+
+                # vectorising the comparisons between the numerator terms used to calculate the rate, for indices at rate artifacts
+                diff_artifact_comp = pulse_trains[mu,discharge_times[mu][artifact_inds]] < pulse_trains[mu, discharge_times[mu][artifact_inds + 1]]
+                # 0 means discharge_times[mu][artifact_inds]] was less, 1 means discharge_times[mu][artifact_inds]] was more
+                less_or_more = np.argmax([diff_artifact_comp, ~diff_artifact_comp], axis=0)
+                discharge_times[mu] = np.delete(discharge_times[mu], artifact_inds + less_or_more)
+
+        discharge_rates = 1/(np.diff(discharge_times[mu]) / fsamp)
+    
+    return discharge_times
+
+
+def refine_mus(signal,signal_mask, pulse_trains_n_1, discharge_times_n_1):
+
+    """ signal is no_chans x time, where no_chans is the total for one grid
+        signal_mask is the channels to discard
+    
+    signal.data(i*64-63:i*64,:), signal.EMGmask{i}, PulseT, distimenew);"""
+
+    print("Refining MU pulse trains...")
+    signal = [x for i, x in enumerate(signal) if signal_mask[i] != 1]
+    nbextchan = 1500
+    extension_factor = round(nbextchan/np.shape(signal)[0])
+    extend_obvs = np.zeros([np.shape(signal)[0]*(extension_factor), np.shape(signal)[0] + extension_factor -1 ])
+    extend_obvs = extend_emg(extend_obvs,signal,extension_factor)
+    re_obvs = np.matmul(extend_obvs, extend_obvs.T)/np.shape(extend_obvs)[1];
+    invre_obvs = np.linalg.pinv(re_obvs)
+    pulse_trains_n = np.zeros([np.shape(pulse_trains_n_1)[0], np.shape(pulse_trains_n_1)[1]])
+    discharge_times_n = [None] * len(pulse_trains_n_1)
+
+    # recalculating the mu filters
+
+    for mu in range(len(pulse_trains_n_1)):
+
+        mu_filters = np.sum(extend_obvs[:,discharge_times_n_1[mu]],axis=1)
+        IPTtmp = np.dot(np.dot(mu_filters.T,invre_obvs),extend_obvs)
+        pulse_trains_n[mu,:] = IPTtmp[:np.shape(signal)[1]]
+
+        pulse_trains_n[mu,:] = pulse_trains_n[mu,:]/ np.max(pulse_trains_n[mu,:])
+        pulse_trains_n[mu,:] = np.multiply( pulse_trains_n[mu,:],abs(pulse_trains_n[mu,:])) 
+        peaks, _ = scipy.signal.find_peaks(np.squeeze(pulse_trains_n[mu,:]))  # why no distance threshold anymore?
+        kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(pulse_trains_n[mu,peaks].reshape(-1,1)) 
+        spikes_ind = np.argmax(kmeans.cluster_centers_)
+        discharge_times_n[mu] = peaks[np.where(kmeans.labels_ == spikes_ind)] 
+
    
+    print(f"Refined {len(pulse_trains_n_1)} MUs")
+
+    return discharge_times_n
