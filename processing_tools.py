@@ -6,7 +6,9 @@ from scipy.fft import fft
 import matplotlib.pyplot as plt
 import sklearn 
 from sklearn.cluster import KMeans
-# @numba.jit
+import numba
+from numba import jit
+
 ##################################### FILTERING TOOLS #######################################################
 
 def notch_filter(signal,fsamp,to_han = False):
@@ -82,7 +84,7 @@ def bandpass_filter(signal,fsamp, order = 2, lowfreq = 20, highfreq = 500):
     highcut = highfreq/nyq
     [b,a] = scipy.signal.butter(order, [lowcut,highcut],'bandpass') # the cut off frequencies should be inputted as normalised angular frequencies
 
-    filtered_signal = np.zeros([np.shape(signal)[0],np.shape(signal)[1]])
+    filtered_signal = np.zeros([np.shape(signal)])
     # construct and apply filter
     for chan in range(np.shape(signal)[0]):
         
@@ -99,14 +101,13 @@ def extend_emg(extended_template, signal, ext_factor):
 
     # signal = self.signal_dict['batched_data'][tracker][0:] (shape is channels x temporal observations)
 
-    nchans = np.shape(signal)[0]
-    nobvs = np.shape(signal)[1]
+    nchans, nobvs = np.shape(signal) 
     for i in range(ext_factor):
 
-        lag_block = i + 1
-        extended_template[nchans*(lag_block-1):nchans*lag_block, i:nobvs +i] = signal
+        extended_template[nchans*i :nchans*(i+1), i:nobvs +i] = signal
   
     return extended_template
+
 
 
 def whiten_emg(signal):
@@ -118,10 +119,10 @@ def whiten_emg(signal):
     
     cov_mat = np.cov(np.squeeze(signal))
     # get the eigenvalues and eigenvectors of the covariance matrix
-    evalues, evectors  = scipy.linalg.eig(cov_mat) 
+    evalues, evectors  = scipy.linalg.eigh(cov_mat) 
     # in MATLAB: eig(A) returns diagonal matrix D of eigenvalues and matrix V whose columns are the corresponding right eigenvectors, so that A*V = V*D
     # sort the eigenvalues in descending order, and then find the regularisation factor = "average of the smallest half of the eigenvalues of the correlation matrix of the extended EMG signals" (Negro 2016)
-    sorted_evalues = np.flip(np.sort(evalues))
+    sorted_evalues = np.sort(evalues)[::-1]
     penalty = np.mean(sorted_evalues[int(len(sorted_evalues)/2):])
   
     if penalty < 0:
@@ -136,14 +137,14 @@ def whiten_emg(signal):
     evectors = evectors[:,evalues > hard_limit]
     evalues = evalues[evalues>hard_limit]
     diag_mat = np.diag(evalues)
-    
     # np.dot is faster than @, since it's derived from C-language
-    whitening_mat = np.dot(np.dot(evectors,np.linalg.inv(np.sqrt(diag_mat))),np.transpose(evectors))
-    dewhitening_mat = np.dot(np.dot(evectors,np.sqrt(diag_mat)),np.transpose(evectors))
-    whitened_emg =  np.dot(whitening_mat,signal).real 
+    # np.linalg.solve can be faster than np.linalg.inv
+    whitening_mat = np.matmul(np.matmul(evectors, np.linalg.inv(np.sqrt(diag_mat))), np.transpose(evectors))
+    dewhitening_mat = np.matmul(np.matmul(evectors, np.sqrt(diag_mat)), np.transpose(evectors))
+    whitened_emg =  np.matmul(whitening_mat, signal).real 
 
     
-    return whitened_emg
+    return whitened_emg, whitening_mat, dewhitening_mat
 
 
 
@@ -154,32 +155,59 @@ def whiten_emg(signal):
 
 
 ###################################### DECOMPOSITION TOOLS ##################################################################
-
+@numba.njit
 def square(x):
     return np.square(x)
 
+@numba.njit
 def skew(x):
     return x**3/3
 
+@numba.njit
 def exp(x):
     return np.exp(-np.square(x)/2)
 
+@numba.njit
 def logcosh(x):
     return np.log(np.cosh(x))
 
+@numba.njit
 def dot_square(x):
     return 2*x
 
+@numba.njit
 def dot_skew(x):
     return 2*(np.square(x))/3
 
+@numba.njit
 def dot_exp(x):
     return -1*(np.exp(-np.square(x)/2)) + np.dot((np.square(x)), np.exp(-np.square(x)/2))
 
+@numba.njit
 def dot_logcosh(x):
     return np.tanh(x)
+"""
+@numba.njit(fastmath=True)
+def np_apply_along_axis(func1d, axis, arr):
+  assert arr.ndim == 2
+  assert axis in [0, 1]
+  if axis == 0:
+    result = np.empty(arr.shape[1])
+    for i in range(len(result)):
+      result[i] = func1d(arr[:, i])
+  else:
+    result = np.empty(arr.shape[0])
+    for i in range(len(result)):
+      result[i] = func1d(arr[i, :])
+  return result
 
-def fixed_point_alg(w_n, B, Z, its = 500, cf = 'square'):
+@numba.njit
+def np_mean(array, axis):
+  return np_apply_along_axis(np.mean, axis, array)"""
+
+
+@numba.njit(fastmath=True)
+def fixed_point_alg(w_n, B, Z,cf, dot_cf, its = 500):
 
     """ Update function for source separation vectors. The code user can select their preferred contrast function using a string input:
     1) square --> x^2
@@ -190,43 +218,35 @@ def fixed_point_alg(w_n, B, Z, its = 500, cf = 'square'):
     Upon meeting a threshold difference between iterations of the algorithm, separation vectors are discovered 
     
     The maximum number of iterations (its) and the contrast function type (cf) are already specified, unless alternative input is provided. """
-
-
-    if cf == 'square':
-        cf = square
-        dot_cf = dot_square
-    elif cf == 'skew':
-        cf = skew
-        dot_cf = dot_skew
-    elif cf == 'exp':
-        cf = exp
-        dot_cf = dot_exp
-    elif cf == 'logcosh':
-        cf = logcosh
-        dot_cf = dot_logcosh
    
+    assert B.ndim == 2
+    assert Z.ndim == 2
+    assert w_n.ndim == 1
+    assert its in [500]
+
     counter = 0
     its_tolerance = 0.0001
-    sep_diff = np.ones([its])
-    w_n = np.expand_dims(w_n,axis=1)
-    B_T_B = np.matmul(B,np.transpose(B))
+    sep_diff = np.ones(its)
+    B_T_B = B @ B.T
+    Z_meaner = Z.shape[1]
 
-    while sep_diff[counter] > its_tolerance:
+    while sep_diff[counter] > its_tolerance or counter >= its:
 
         # transfer current separation vector as the previous arising separation vector
-        w_n_1 = w_n 
+        w_n_1 = w_n.copy()
         # use update function to get new, current separation vector
-        #A = np.mean(dot_cf(np.transpose(w_n_1) @ Z))
-        A =  dot_cf(np.dot(np.transpose(w_n_1), Z)).mean()
-        w_n = np.expand_dims((Z*cf(np.dot(np.transpose(w_n_1), Z))).mean(axis=1),axis=1) - A * w_n_1
+        wTZ = w_n_1.T @ Z 
+        A = dot_cf(wTZ).mean()
+        w_n = Z @ cf(wTZ).T / Z_meaner  - A * w_n_1
+        #w_n = np_mean(Z * cf(wTZ), axis = 1) - A * w_n_1
+        #print(np.allclose(w_n,other_w_n))
+
         # orthogonalise separation vectors
-        w_n = w_n - np.dot(B_T_B,w_n)
+        w_n -= np.dot(B_T_B, w_n)
         # normalise separation vectors
-        w_n = w_n/np.linalg.norm(w_n)
-        counter = counter + 1
-        sep_diff[counter] = abs(np.dot(np.transpose(w_n),w_n_1) - 1)
-        if counter >= its:
-            break
+        w_n /= np.linalg.norm(w_n)
+        counter += 1
+        sep_diff[counter] = np.abs(w_n @ w_n_1 - 1)
 
     return w_n
 
@@ -238,41 +258,44 @@ def get_spikes(w_n,Z, fsamp):
     vector estimate. Results in a reduction in ISI vairability (by seeking to minimise the covariation in MU discharges)"""
 
     # Step 4a: 
-    source_pred = np.square(np.dot(np.transpose(w_n),Z)).real # element-wise square of the input to estimate the ith source
+    #source_pred = np.square(np.dot(np.transpose(w_n),Z)).real # element-wise square of the input to estimate the ith source
+    source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
+    source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     # Step 4b:
-    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = fsamp*0.01 ) # peaks variable holds the indices of all peaks
+    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = fsamp*0.02 ) # peaks variable holds the indices of all peaks
+    #source_pred /= np.mean(source_pred[:,np.argpartition(source_pred[:,peaks], -10)[-10:]]) 
+    #print(np.shape(source_pred))
+    print(np.shape(source_pred))
     if len(peaks) > 1:
 
-        kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[:,peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
+        kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
         spikes_ind = np.argmax(kmeans.cluster_centers_)
         spikes = peaks[np.where(kmeans.labels_ == spikes_ind)]
+        #print(np.shape(spikes))
+        # remove outliers from the spikes cluster with a std-based threshold
+        #spikes = spikes[source_pred[:,spikes] < np.mean(source_pred[:,spikes],axis=1) +3*np.std(source_pred[spikes],axis=1)]
+    else:
+        spikes = peaks
 
     return source_pred, spikes
 
-def min_cov_isi(w_n,B,Z,fsamp,cov_n,spikes_n):  #
-
-    " Iteratively computing the "
-
-    counter = 0
+def min_cov_isi(w_n,B,Z,fsamp,cov_n,spikes_n): 
+    
     cov_n_1 = 2 * cov_n
     while cov_n < cov_n_1:
 
-        cov_n_1 = cov_n
-        spikes_n_1 = spikes_n
-        w_n = np.expand_dims(w_n,axis=1)
-        w_n_1 = w_n
+        cov_n_1 = cov_n.copy()
+        spikes_n_1 = spikes_n.copy()
+        # w_n = np.expand_dims(w_n,axis=1)
+        w_n_1 = w_n.copy()
         _ , spikes = get_spikes(w_n,Z,fsamp)
-
-        ################# MINIMISATION OF COV OF DISCHARGES ############################
-        if len(spikes) > 10: # why in MATLAB code this threshold is removed for the minimisation loop?
-
-            # determine the interspike interval
-            ISI = np.diff(spikes/fsamp)
-            # determine the coefficient of variation
-            CoV = np.std(ISI)/np.mean(ISI)
-            # update the sepearation vector by summing all the spikes
-            w_n = np.sum(Z[:,spikes],axis=1) # summing the spiking across time, leaving an array that is channels x 1 
-            counter = counter + 1
+        # determine the interspike interval
+        ISI = np.diff(spikes/fsamp)
+        # determine the coefficient of variation
+        CoV = np.std(ISI)/np.mean(ISI)
+        # update the sepearation vector by summing all the spikes
+        w_n = np.sum(Z[:,spikes],axis=1) # summing the spiking across time, leaving an array that is channels x 1 
+       
 
     # if you meet the CoV minimisation condition, but with a single-spike-long train, use the updated
     # separation vector and recompute the spikes
@@ -280,7 +303,7 @@ def min_cov_isi(w_n,B,Z,fsamp,cov_n,spikes_n):  #
     if len(spikes) < 2:
         _ , spikes = get_spikes(w_n,Z,fsamp)
 
-    return np.squeeze(w_n_1), spikes_n_1
+    return w_n_1, spikes_n_1
 
 
 ################################ VALIDATION TOOLS ########################################
@@ -292,7 +315,7 @@ def get_silohuette(w_n,Z,fsamp):
     source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     
     # Step 4b:
-    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.01) ) # this is approx a value of 20, which is in time approx 10ms
+    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02) ) # this is approx a value of 20, which is in time approx 10ms
     if len(peaks) > 1:
 
         kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
@@ -310,15 +333,15 @@ def peel_off(Z,spikes,fsamp):
     windowl = round(0.05*fsamp)
     waveform = np.zeros([windowl*2+1])
     firings = np.zeros([np.shape(Z)[1]])
-    firings[spikes] = 1; # make the firings binary
-    EMGtemp = np.zeros([np.shape(Z)[0],np.shape(Z)[1]]); # intialise a temporary EMG signal
+    firings[spikes] = 1 # make the firings binary
+    EMGtemp = np.empty(Z.shape) # intialise a temporary EMG signal
 
     for i in range(np.shape(Z)[0]): # iterating through the (extended) channels
         temp = cutMUAP(spikes,windowl,Z[i,:])
         waveform = np.mean(temp,axis=0)
         EMGtemp[i,:] =  np.convolve(firings, waveform, "same")
 
-    Z = Z - EMGtemp; # removing the EMG representation of the source spearation vector from the signal, avoid picking up replicate content in future iterations
+    Z -= EMGtemp; # removing the EMG representation of the source spearation vector from the signal, avoid picking up replicate content in future iterations
     return Z
 ############################## POST PROCESSING #####################################################
 
@@ -339,8 +362,11 @@ def cutMUAP(MUPulses, length, Y):
     c = len(MUPulses)
     edge_len = round(length / 2)
     tmp = scipy.signal.windows.gaussian(2 * edge_len, std=edge_len / 3)
-    win = np.concatenate((tmp[:edge_len], np.ones(2 * length - 2 * edge_len + 1), tmp[edge_len:]))
-    MUAPs = np.zeros((c, 1 + 2 * length))
+    # create the filtering window 
+    win = np.ones(2 * length + 1)
+    win[:edge_len] = tmp[:edge_len]
+    win[-edge_len:] = tmp[edge_len:]
+    MUAPs = np.empty((c, 1 + 2 * length))
     for k in range(c):
         start = max(MUPulses[k] - length, 1) - (MUPulses[k] - length)
         end = MUPulses[k] + length- min(MUPulses[k] + length, len(Y))
@@ -460,7 +486,7 @@ def refine_mus(signal,signal_mask, pulse_trains_n_1, discharge_times_n_1):
     extension_factor = round(nbextchan/np.shape(signal)[0])
     extend_obvs = np.zeros([np.shape(signal)[0]*(extension_factor), np.shape(signal)[0] + extension_factor -1 ])
     extend_obvs = extend_emg(extend_obvs,signal,extension_factor)
-    re_obvs = np.matmul(extend_obvs, extend_obvs.T)/np.shape(extend_obvs)[1];
+    re_obvs = np.matmul(extend_obvs, extend_obvs.T)/np.shape(extend_obvs)[1]
     invre_obvs = np.linalg.pinv(re_obvs)
     pulse_trains_n = np.zeros([np.shape(pulse_trains_n_1)[0], np.shape(pulse_trains_n_1)[1]])
     discharge_times_n = [None] * len(pulse_trains_n_1)
@@ -484,3 +510,38 @@ def refine_mus(signal,signal_mask, pulse_trains_n_1, discharge_times_n_1):
     print(f"Refined {len(pulse_trains_n_1)} MUs")
 
     return discharge_times_n
+
+
+###############################################################################################################
+################################ ADDITIONAL REAL-TIME DECOMPOSITION TOOLS #####################################
+###############################################################################################################
+
+def extend_emg_online(extended_template, signal2extend, ext_factor, signal2fillwith):
+
+    """ Extension of EMG signals, for a given window, and a given grid. For extension, R-1 versions of the original data are stacked, with R-1 timeshifts.
+    Structure: [channel1(k), channel2(k),..., channelm(k); channel1(k-1), channel2(k-1),...,channelm(k-1);...;channel1(k - (R-1)),channel2(k-(R-1)), channelm(k-(R-1))] """
+
+    # signal = self.signal_dict['batched_data'][tracker][0:] (shape is channels x temporal observations)
+
+    nchans, nobvs = np.shape(signal) 
+    for i in range(ext_factor):
+        extended_template[nchans*i :nchans*(i+1), i:nobvs +i] = signal
+        # here we then define outisde the range of i:nobvs +i to be filled with neighbouring data points
+  
+    return extended_template
+
+
+def get_spiketrains_online(Z,sep_matrix):
+
+    spike_trains = (sep_matrix.T @ Z).real
+
+    return spike_trains
+
+
+def get_spikes_online(source_pred, fsamp, cluster_centers):
+
+    source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
+    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02) ) # this is approx a value of 20, which is in time approx 10ms
+    discharge_times = 1
+
+    return discharge_times
