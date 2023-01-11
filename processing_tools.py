@@ -516,29 +516,31 @@ def refine_mus(signal,signal_mask, pulse_trains_n_1, discharge_times_n_1):
 ################################ ADDITIONAL REAL-TIME DECOMPOSITION TOOLS #####################################
 ###############################################################################################################
 
-def extend_emg_online(extended_template, signal2extend, ext_factor, signal2fillwith):
+def extend_and_clip_emg_online(exandclip_template, packet2extend, ext_factor, buffer4fill):
 
     """ Extension of EMG signals, for a given window, and a given grid. For extension, R-1 versions of the original data are stacked, with R-1 timeshifts.
     Structure: [channel1(k), channel2(k),..., channelm(k); channel1(k-1), channel2(k-1),...,channelm(k-1);...;channel1(k - (R-1)),channel2(k-(R-1)), channelm(k-(R-1))] """
+    
+    nchans, nobvs = np.shape(packet2extend) 
+    for i in range(1,ext_factor):
 
-    # signal = self.signal_dict['batched_data'][tracker][0:] (shape is channels x temporal observations)
-
-    nchans, nobvs = np.shape(signal) 
-    for i in range(ext_factor):
-        extended_template[nchans*i :nchans*(i+1), i:nobvs +i] = signal
-        # here we then define outisde the range of i:nobvs +i to be filled with neighbouring data points
-  
-    return extended_template
+        exandclip_template[nchans*i:nchans*(i+1),i:] = packet2extend[:-i] # clip on RHS
+        exandclip_template[nchans*i:nchans*(i+1),:i] = buffer4fill[:,-nobvs-i:-nobvs]
+   
+    return exandclip_template
 
 
-def get_spiketrains_online(Z,sep_matrix):
+def get_trains_online(Z,sep_matrix):
 
     spike_trains = (sep_matrix.T @ Z).real
+    # (1008 x 300).T @ (1008 x 256)
+    # (300 x 1008) @ (1008 x 256)
+    # (300 x 256)
 
     return spike_trains
 
 
-def get_spikes_online(source_pred, fsamp, cluster_centers):
+def get_discharges_online(source_pred, fsamp, cluster_centers):
 
     source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02) ) # this is approx a value of 20, which is in time approx 10ms
