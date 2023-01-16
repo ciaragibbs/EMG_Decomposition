@@ -25,12 +25,13 @@ class EMG():
         self.silthrpeeloff = 0.78 # Threshold for MU removed from the signal (if the sparse  deflation is on)
         self.ext_factor = 1000 # extension of observations for numerical stability 
 
-########################################## PRE PROCESSING #############################################
+
+
+#######################################################################################################
+########################################## OFFLINE EMG ################################################
 #######################################################################################################
 
-class preprocess_EMG(EMG):
-
-    """ Loading the intramuscular and HDsEMG data"""
+class offline_EMG(EMG):
 
     # child class of EMG, so will inherit it's initialisaiton
     def __init__(self, save_dir):
@@ -88,11 +89,8 @@ class preprocess_EMG(EMG):
 
             # only opening the last two .sip files because the first is not needed for analysis
             # would only need MSE between the participant path (file 2) and the target path (file 3)
-
             ######## path #########
-            discard, target_label, path_label = glob.glob(f'{temp_dir}/*.sip')
-            #print(f'path_label: {path_label}')
-            #print(f'target_label: {target_label}')
+            _, target_label, path_label = glob.glob(f'{temp_dir}/*.sip')
             with open(path_label) as file:
                 path = np.fromfile(file, dtype='float64')
                 path = path[:np.shape(emg_data)[1]]
@@ -198,7 +196,7 @@ class preprocess_EMG(EMG):
                         [1, 9, 17, 25, 33, 41, 49, 57],
                         [0, 8, 16, 24, 32, 40, 48, 56]]
 
-                rejected_channels = np.zeroes([self.signal_dict['ngrids'],65])
+                rejected_channels = np.zeros([self.signal_dict['ngrids'],65])
                 IED = 10
 
             elif grid_names[i] == 'intraarrays':
@@ -264,16 +262,12 @@ class preprocess_EMG(EMG):
                     if (c+r) > 0: # TO-DO: remove the assumption of the left corner channel being invalid
                         plt.plot(sig2inspect[(c*self.r_maps[i])+r-1,:]/max(sig2inspect[(c*self.r_maps[i])+r-1,:])+r+1)
                 plt.show()
-                        
-
-                
                 
                 inputchannels = simpledialog.askstring(title="Channel Rejection",
                                   prompt="Please enter channel numbers to be rejected (1-13), input with spaces between numbers:")
                 print("The selected channels for rejection are:", inputchannels)
                 
                 if inputchannels:
-
                     str_chans2reject = inputchannels.split(" ")
                     for j in range(len(str_chans2reject)):
 
@@ -283,8 +277,6 @@ class preprocess_EMG(EMG):
         
         self.rejected_channels = self.rejected_channels[:,1:] # get rid of the irrelevant top LHC channel
       
-        
-
     def batch_w_target(self):
 
         plateau = np.where(self.signal_dict['target'] == max(self.signal_dict['target']))[0] # finding where the plateau is
@@ -389,10 +381,6 @@ class preprocess_EMG(EMG):
 
   
 ################################ CONVOLUTIVE SPHERING ########################################
-##############################################################################################
-
-                       
-
     def convul_sphering(self,g,interval,tracker):
 
         """ 1) Filter the batched EMG data 2) Extend to improve speed of convergence/reduce numerical instability 3) Remove any DC component  4) Whiten """
@@ -408,21 +396,19 @@ class preprocess_EMG(EMG):
             self.signal_dict['batched_data'][tracker]= []
             self.signal_dict['batched_data'][tracker]= np.diff(self.signal_dict['batched_data'][tracker],n=1,axis=-1)
 
-        # processing is single grid, but all windows from here onwards
-            
         # signal extension - increasing the number of channels to 1000
         # Holobar 2007 -  Multichannel Blind Source Separation using Convolutive Kernel Compensation (describes matrix extension)
         extension_factor = int(np.round(self.ext_factor/len(self.signal_dict['batched_data'][tracker])))
       
         self.signal_dict['extend_obvs_old'][interval] = extend_emg(self.signal_dict['extend_obvs_old'][interval], self.signal_dict['batched_data'][tracker], extension_factor)
-        self.signal_dict['sq_extend_obvs'][interval] = np.matmul(self.signal_dict['extend_obvs_old'][interval],np.transpose(self.signal_dict['extend_obvs_old'][interval])) / np.shape(self.signal_dict['extend_obvs'][interval])[1]
+        self.signal_dict['sq_extend_obvs'][interval] = (self.signal_dict['extend_obvs_old'][interval] @ self.signal_dict['extend_obvs_old'][interval].T) / np.shape(self.signal_dict['extend_obvs_old'][interval])[1]
         self.signal_dict['inv_extend_obvs'][interval] = np.linalg.pinv(self.signal_dict['sq_extend_obvs'][interval])
         
         # de-mean the extended emg observation matrix
         self.signal_dict['extend_obvs_old'][interval] = scipy.signal.detrend(self.signal_dict['extend_obvs_old'][interval], axis=- 1, type='constant', bp=0)
         
         # whiten the signal + impose whitened extended observation matrix has a covariance matrix equal to the identity for time lag zero
-        self.decomp_dict['whitened_obvs_old'][interval],_, self.decomp_dict['dewhiten_mat'][interval] = whiten_emg(self.signal_dict['extend_obvs_old'][interval])
+        self.decomp_dict['whitened_obvs_old'][interval],self.decomp_dict['whiten_mat'][interval], self.decomp_dict['dewhiten_mat'][interval] = whiten_emg(self.signal_dict['extend_obvs_old'][interval])
         
         # remove the edges
         self.signal_dict['extend_obvs'][interval] = self.signal_dict['extend_obvs_old'][interval][:,int(np.round(self.signal_dict['fsamp']*0.5)-1):-int(np.round(self.signal_dict['fsamp']*0.5))]
@@ -431,26 +417,21 @@ class preprocess_EMG(EMG):
         if g == 0: # don't need to repeat for every grid, since the path and target info (informing the batches), is the same for all grids
             self.plateau_coords[interval*2] = self.plateau_coords[interval*2]  + int(np.round(self.signal_dict['fsamp']*0.5)) - 1
             self.plateau_coords[(interval+1)*2 - 1] = self.plateau_coords[(interval+1)*2-1]  - int(np.round(self.signal_dict['fsamp']*0.5))
-           
 
         print('Signal extension and whitening complete')
-
+        
 ######################### FAST ICA AND CONVOLUTIVE KERNEL COMPENSATION  ############################################
-####################################################################################################################
 
     def fast_ICA_and_CKC(self,g,interval,tracker,cf_type = 'logcosh'):
 
         
         init_its = np.zeros([self.its],dtype=int) # tracker of initialisaitons of separation vectors across iterations
         fpa_its = 500 # maximum number of iterations for the fixed point algorithm
-        
         # identify the time instant at which the maximum of the squared summation of all whitened extended observation vectors
         # occurs. Then, project vector is initialised to the whitened observation vector, at this located time instant.
-        Z = np.array(self.decomp_dict['whitened_obvs'][interval])
+        Z = np.array(self.decomp_dict['whitened_obvs'][interval]).copy()
         sort_sq_sum_Z = np.argsort(np.square(np.sum(Z, axis = 0)))
-        # create a time axis for spiking activity
-        time_axis = np.linspace(0,np.shape(Z)[1],np.shape(Z)[1])/self.signal_dict['fsamp']
-
+        time_axis = np.linspace(0,np.shape(Z)[1],np.shape(Z)[1])/self.signal_dict['fsamp']  # create a time axis for spiking activity
 
         # choosing contrast function here, avoid repetitively choosing within the iteration loop
         if cf_type == 'square':
@@ -469,30 +450,18 @@ class preprocess_EMG(EMG):
         for i in range(self.its):
 
                 #################### FIXED POINT ALGORITHM #################################
-
                 init_its[i] = sort_sq_sum_Z[-(i+1)] # since the indexing starts at -1 the other way (for ascending order list)
-                
                 self.decomp_dict['w_sep_vect'] = Z[:,int(init_its[i])].copy() # retrieve the corresponding signal value to initialise the separation vector
                 # orthogonalise separation vector before fixed point algorithm
-                self.decomp_dict['w_sep_vect'] = self.decomp_dict['w_sep_vect'] - np.dot(np.matmul(self.decomp_dict['B_sep_mat'],np.transpose(self.decomp_dict['B_sep_mat'])),self.decomp_dict['w_sep_vect'])
+                self.decomp_dict['w_sep_vect'] -= np.dot(np.matmul(self.decomp_dict['B_sep_mat'],np.transpose(self.decomp_dict['B_sep_mat'])),self.decomp_dict['w_sep_vect'])
                 # normalise separation vector before fixed point algorithm 
-                self.decomp_dict['w_sep_vect'] = self.decomp_dict['w_sep_vect']/np.linalg.norm(self.decomp_dict['w_sep_vect'])
-                #self.decomp_dict['w_sep_vect'] = np.array(self.decomp_dict['w_sep_vect'])
+                self.decomp_dict['w_sep_vect'] /= np.linalg.norm(self.decomp_dict['w_sep_vect'])
+            
                 # use the fixed point algorithm to identify consecutive separation vectors
-                t_fixed = time.time()
                 self.decomp_dict['w_sep_vect'] = fixed_point_alg(self.decomp_dict['w_sep_vect'],self.decomp_dict['B_sep_mat'],Z, cf, dot_cf,fpa_its)
-                print('Time for fixed point algorithm')
-                print(time.time()-t_fixed)
-                
-                ### to do ### need to give option at beginning to choose contrast function, for now it is squared unless stated otherwise
-                #t_gs = time.time()
-                print(np.shape(self.decomp_dict['w_sep_vect']))
                 fICA_source, spikes = get_spikes(self.decomp_dict['w_sep_vect'],Z, self.signal_dict['fsamp'])
-                #print('Time for getting spikes')
-                #print(time.time()-t_gs)
-
+            
                 ################# MINIMISATION OF COV OF DISCHARGES ############################
-
                 if len(spikes) > 10:
 
                     # determine the interspike interval
@@ -502,25 +471,16 @@ class preprocess_EMG(EMG):
                     # update the sepearation vector by summing all the spikes
                     w_n_p1 = np.sum(Z[:,spikes],axis=1) # summing the spiking across time, leaving an array that is channels x 1 
                     # minimisation of covariance of interspike intervals
-                    #t_cov = time.time()
                     self.decomp_dict['MU_filters'][interval][:,i], spikes = min_cov_isi(w_n_p1,self.decomp_dict['B_sep_mat'],Z, self.signal_dict['fsamp'],CoV,spikes)
-                    self.decomp_dict['B_sep_mat'][:,i] = np.squeeze(self.decomp_dict['w_sep_vect']).real 
-                    #print('Time for cov isi')
-                    #print(time.time()-t_cov)
-                    # had to make it have a second dimension of 1 for matrix multiplication, so squeeze now to remove for storage
-                    # also .real since it has 0js atm
+                    self.decomp_dict['B_sep_mat'][:,i] = (self.decomp_dict['w_sep_vect']).real # no need to shallow copy here
 
                     # calculate SIL
                     fICA_source, spikes, self.decomp_dict['SILs'][interval,i] = get_silohuette(self.decomp_dict['MU_filters'][interval][:,i],Z,self.signal_dict['fsamp'])
                     # peel off
-
-                    #t_peel = time.time()
                     if self.peel_off == 1 and self.decomp_dict['SILs'][interval,i] > self.sil_thr:
                         Z = peel_off(Z, spikes, self.signal_dict['fsamp'])
-                    #print('Time for peel')
-                    #print(time.time()-t_peel)
             
-                    if self.drawing_mode == 0:
+                    if self.drawing_mode == 1:
                         plt.clf()
                         plt.ion()
                         plt.show()
@@ -538,20 +498,20 @@ class preprocess_EMG(EMG):
                     else:
                         print('Grid #{} - Iteration #{} - Sil = {}'.format(g, i, self.decomp_dict['SILs'][interval,i]))
 
-
                 else:
                     print('Grid #{} - Iteration #{} - less than 10 spikes '.format(g, i))
                     # without enough spikes, we skip minimising the covariation of discharges to improve the separation vector
-                    self.decomp_dict['B_sep_mat'][:,i] = self.decomp_dict['w_sep_vect'].real 
+                    self.decomp_dict['B_sep_mat'][:,i] = self.decomp_dict['w_sep_vect'].real  # no need to shallow copy here
 
+        # remove the MU filters that fall below the imposed SIL threshold
         self.decomp_dict['MU_filters'][interval][:,self.decomp_dict['SILs'][interval,:] < self.self.sil_thr] =[]
 
 
 
 
 
-
-    """def post_process_EMG():
+"""
+    def post_process_EMG():
 
         # batch processing over each window
         pulse_trains, discharge_times = batch_process_filters(dewhit_mat, mu_filters,inv_extend_obvs,extend_obvs,plateau,exfactor,diff,orig_sig_size,fsamp)
@@ -566,12 +526,69 @@ class preprocess_EMG(EMG):
         [signal.Pulsetrain{i}, distimenew] = refine_mus(signal.data(i*64-63:i*64,:), signal.EMGmask{i}, PulseT, distimenew);
 
         # removing outliers generating irrelvatn discharge rates before manual edition (2nd time)
-        new_discharge_times = remove_outliers(signal.Pulsetrain{i}, distimenew, signal.fsamp);"""
+        new_discharge_times = remove_outliers(signal.Pulsetrain{i}, distimenew, signal.fsamp);
             
+"""
 
 
+########################################################################################################################  
+############################################### ONLINE EMG #############################################################       
+######################################################################################################################## 
 
+class online_EMG(EMG):
 
+    # child class of EMG, so will inherit it's initialisaiton
+    def __init__(self, save_dir, offline_dict):
         
+        super().__init__()
+        self.save_dir = save_dir # file path 
+
+        try:
+            self.ngrids = offline_dict['ngrids']
+            self.rejected_channels = offline_dict['rejected_channels']
+            self.cluster_centers = offline_dict['cluster_centers']
+            self.mu_filters = offline_dict['mu_filters']
+            self.fsamp = offline_dict['fsamp']
+            self.peaks_previous = [] # empty initialisation needed to ensure code for peak comparison works for first run
+            # calculated
+            self.chans_per_grid = int(len(self.rejected_channels)/self.ngrids)
+        except ValueError:
+            print('You have not passed the right data paremters to perform decomposition in real time.')
+
+    def automatic_rejection(self,packet):
+
+        # assuming that this is the 256-sample packet of data fed into the buffer, and that you intend to iterate over different grids
+        accepted_data = [None] * (self.ngrids)
+        for i in range(int(self.ngrids)):
+            grid = i + 1
+            emg_grid =  packet[self.chans_per_grid*(grid-1):grid*self.chans_per_grid,:]
+            rejected_channels_slice = self.rejected_channels[i,:] == 1
+            # Remove rejected channels
+            accepted_data[i] = np.delete(emg_grid, rejected_channels_slice, 0)
+
+        self.signal_dict['packet_data'] = accepted_data
+        
+    def extract_spike_trains(self, extended_template, ext_factor, packet2extend ,buffer2fill):
+
+        self.signal_dict['extend_obvs'] = extend_and_clip_emg_online(extended_template, packet2extend, ext_factor, buffer2fill)
+        self.signal_dict['trains']= get_trains_online(self.signal_dict['extend_obvs'],self.mu_filters)
+
+    def extract_discharges(self):
+
+        win_size = 256 
+        trains = np.multiply(trains,abs(trains)) # keep the negatives # TO DO: normalise
+        dist = np.round(self.fsamp*0.01)
+        peaks_latest, _ = scipy.signal.find_peaks(np.squeeze(trains), distance = dist ) # this caps the max isi to 100Hz
+        # correction of peak locations with overlapping windows 
+        peaks_combined = np.unique(np.concatenate((self.peaks_previous , peaks_latest + win_size - dist)))
+        peaks_latest =  peaks_combined[peaks_combined>= win_size] - win_size
+        self.peaks_previous = peaks_latest.copy() # store for use in comparison
+        # sample window_length + min_dist_betw_peaks in data 
+        # between the period of overlap, you add the index of shift
+        discharges= knn_online(peaks_latest, self.cluster_centers)
+
+        return discharges
+        
+
 
 
