@@ -84,7 +84,7 @@ def bandpass_filter(signal,fsamp, order = 2, lowfreq = 20, highfreq = 500):
     highcut = highfreq/nyq
     [b,a] = scipy.signal.butter(order, [lowcut,highcut],'bandpass') # the cut off frequencies should be inputted as normalised angular frequencies
 
-    filtered_signal = np.zeros([np.shape(signal)])
+    filtered_signal = np.zeros([np.shape(signal)[0],np.shape(signal)[1]])
     # construct and apply filter
     for chan in range(np.shape(signal)[0]):
         
@@ -101,13 +101,13 @@ def extend_emg(extended_template, signal, ext_factor):
 
     # signal = self.signal_dict['batched_data'][tracker][0:] (shape is channels x temporal observations)
 
-    nchans, nobvs = np.shape(signal) 
+    nchans = np.shape(signal)[0]
+    nobvs = np.shape(signal)[1]
     for i in range(ext_factor):
 
         extended_template[nchans*i :nchans*(i+1), i:nobvs +i] = signal
   
     return extended_template
-
 
 
 def whiten_emg(signal):
@@ -139,8 +139,8 @@ def whiten_emg(signal):
     diag_mat = np.diag(evalues)
     # np.dot is faster than @, since it's derived from C-language
     # np.linalg.solve can be faster than np.linalg.inv
-    whitening_mat = np.matmul(np.matmul(evectors, np.linalg.inv(np.sqrt(diag_mat))), np.transpose(evectors))
-    dewhitening_mat = np.matmul(np.matmul(evectors, np.sqrt(diag_mat)), np.transpose(evectors))
+    whitening_mat = evectors @ np.linalg.inv(np.sqrt(diag_mat)) @ np.transpose(evectors)
+    dewhitening_mat = evectors @ np.sqrt(diag_mat) @ np.transpose(evectors)
     whitened_emg =  np.matmul(whitening_mat, signal).real 
 
     
@@ -264,8 +264,6 @@ def get_spikes(w_n,Z, fsamp):
     # Step 4b:
     peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = fsamp*0.02 ) # peaks variable holds the indices of all peaks
     #source_pred /= np.mean(source_pred[:,np.argpartition(source_pred[:,peaks], -10)[-10:]]) 
-    #print(np.shape(source_pred))
-    print(np.shape(source_pred))
     if len(peaks) > 1:
 
         kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
@@ -532,18 +530,26 @@ def extend_and_clip_emg_online(exandclip_template, packet2extend, ext_factor, bu
 
 def get_trains_online(Z,sep_matrix):
 
-    spike_trains = (sep_matrix.T @ Z).real
-    # (1008 x 300).T @ (1008 x 256)
-    # (300 x 1008) @ (1008 x 256)
-    # (300 x 256)
+    return (sep_matrix.T @ Z).real
 
-    return spike_trains
+def euc_distance(points,single_point):
 
+    dist = (points - single_point)**2
+    dist = np.sum(dist, axis=1)
+    dist = np.sqrt(dist)
+    return dist
 
-def get_discharges_online(source_pred, fsamp, cluster_centers):
+def knn_online(trains, fsamp, cluster_centers):
 
-    source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
-    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02) ) # this is approx a value of 20, which is in time approx 10ms
+    spike_ind = np.argmax(cluster_centers)
+    spike_cluster = cluster_centers[spike_ind]
+    noise_cluster = cluster_centers[1-spike_ind]
+    # get the Euclidean distance between the trains and the cluster centers
+    data2spikes = euc_distance(peaks,spike_cluster)
+    data2noise = euc_distance(peaks, noise_cluster)
+    # cluster centers is assumed to be an array : spike_cluster_center, noise_cluster_center
+    
     discharge_times = 1
+
 
     return discharge_times
