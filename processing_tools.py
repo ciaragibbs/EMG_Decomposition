@@ -92,6 +92,47 @@ def bandpass_filter(signal,fsamp, order = 2, lowfreq = 20, highfreq = 500):
     
     return filtered_signal
 
+
+
+def moving_mean1d(v,w):
+    """ Moving average filter that replicates the method of movmean in MATLAB
+    v is a 1 dimensional vector to be filtered via a moving average
+    w is the window length of this filter """
+
+    u = v.copy()
+    w_temp = w
+    n = len(v)-1
+
+    if w_temp % 2 != 0:
+
+        w = int(np.ceil(w_temp/2))
+        for i in range(w):
+            u[i] = np.mean(v[0:w+i])
+            u[n-i] = np.mean(v[n-(w-1)-i:])
+
+        n1 = 1 + w
+        n2 = n - w
+
+        for i in range(n1-1,n2+1):
+        
+            u[i] = np.mean(v[i - w + 1:i + w])
+
+    else:
+
+        w = int(w_temp/2)
+        for i in range(w):
+            u[i] = np.mean(v[0:w+i])
+            u[n-i] = np.mean(v[n-(w-1)-(i+1):])
+
+        n1 = 1 + w
+        n2 = n - w
+
+        for i in range(n1-1,n2+1):
+            u[i] = np.mean(v[i - w:i + w ])
+
+    return u
+    
+
 ################################# CONVOLUTIVE SPHERING TOOLS ##########################################################
 
 def extend_emg(extended_template, signal, ext_factor):
@@ -117,18 +158,16 @@ def whiten_emg(signal):
 
     # get the covariance matrix of the extended EMG observations
     
-    cov_mat = np.cov(np.squeeze(signal))
+    cov_mat = np.cov(np.squeeze(signal),bias=True)
     # get the eigenvalues and eigenvectors of the covariance matrix
     evalues, evectors  = scipy.linalg.eigh(cov_mat) 
     # in MATLAB: eig(A) returns diagonal matrix D of eigenvalues and matrix V whose columns are the corresponding right eigenvectors, so that A*V = V*D
     # sort the eigenvalues in descending order, and then find the regularisation factor = "average of the smallest half of the eigenvalues of the correlation matrix of the extended EMG signals" (Negro 2016)
     sorted_evalues = np.sort(evalues)[::-1]
-    penalty = np.mean(sorted_evalues[int(len(sorted_evalues)/2):])
-  
-    if penalty < 0:
-        penalty = 0
-
+    penalty = np.mean(sorted_evalues[len(sorted_evalues)//2:]) # int won't wokr for odd numbers
+    penalty = max(0, penalty)
     rank_limit = np.sum(evalues > penalty)-1
+
     if rank_limit < np.shape(signal)[0]:
 
         hard_limit = (np.real(sorted_evalues[rank_limit]) + np.real(sorted_evalues[rank_limit + 1]))/2
@@ -137,8 +176,6 @@ def whiten_emg(signal):
     evectors = evectors[:,evalues > hard_limit]
     evalues = evalues[evalues>hard_limit]
     diag_mat = np.diag(evalues)
-    # np.dot is faster than @, since it's derived from C-language
-    # np.linalg.solve can be faster than np.linalg.inv
     whitening_mat = evectors @ np.linalg.inv(np.sqrt(diag_mat)) @ np.transpose(evectors)
     dewhitening_mat = evectors @ np.sqrt(diag_mat) @ np.transpose(evectors)
     whitened_emg =  np.matmul(whitening_mat, signal).real 
@@ -262,7 +299,7 @@ def get_spikes(w_n,Z, fsamp):
     source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
     source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     # Step 4b:
-    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = fsamp*0.02 ) # peaks variable holds the indices of all peaks
+    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02)+1 ) # peaks variable holds the indices of all peaks
     #source_pred /= np.mean(source_pred[:,np.argpartition(source_pred[:,peaks], -10)[-10:]]) 
     if len(peaks) > 1:
 
