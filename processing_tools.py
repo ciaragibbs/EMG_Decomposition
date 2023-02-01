@@ -5,6 +5,7 @@ from numpy import linalg
 from scipy.fft import fft
 import matplotlib.pyplot as plt
 import sklearn 
+from sklearn.metrics import silhouette_samples
 from sklearn.cluster import KMeans
 import numba
 from numba import jit
@@ -157,7 +158,7 @@ def whiten_emg(signal):
     and expand small directions of variance in the dataset. With this, you decorrelate the data. """
 
     # get the covariance matrix of the extended EMG observations
-    
+
     cov_mat = np.cov(np.squeeze(signal),bias=True)
     # get the eigenvalues and eigenvectors of the covariance matrix
     evalues, evectors  = scipy.linalg.eigh(cov_mat) 
@@ -166,21 +167,23 @@ def whiten_emg(signal):
     sorted_evalues = np.sort(evalues)[::-1]
     penalty = np.mean(sorted_evalues[len(sorted_evalues)//2:]) # int won't wokr for odd numbers
     penalty = max(0, penalty)
-    rank_limit = np.sum(evalues > penalty)-1
 
+
+    rank_limit = np.sum(evalues > penalty)-1
     if rank_limit < np.shape(signal)[0]:
 
         hard_limit = (np.real(sorted_evalues[rank_limit]) + np.real(sorted_evalues[rank_limit + 1]))/2
-    
+
     # use the rank limit to segment the eigenvalues and the eigenvectors
     evectors = evectors[:,evalues > hard_limit]
     evalues = evalues[evalues>hard_limit]
     diag_mat = np.diag(evalues)
+    # np.dot is faster than @, since it's derived from C-language
+    # np.linalg.solve can be faster than np.linalg.inv
     whitening_mat = evectors @ np.linalg.inv(np.sqrt(diag_mat)) @ np.transpose(evectors)
     dewhitening_mat = evectors @ np.sqrt(diag_mat) @ np.transpose(evectors)
     whitened_emg =  np.matmul(whitening_mat, signal).real 
 
-    
     return whitened_emg, whitening_mat, dewhitening_mat
 
 
@@ -289,18 +292,19 @@ def fixed_point_alg(w_n, B, Z,cf, dot_cf, its = 500):
 
 
 
-def get_spikes(w_n,Z, fsamp):
+
+def get_spikes(w_n,Z,fsamp):
 
     """ Based on gradient convolutive kernel compensation. Aim to remove spurious discharges to improve the source separation
     vector estimate. Results in a reduction in ISI vairability (by seeking to minimise the covariation in MU discharges)"""
 
     # Step 4a: 
-    #source_pred = np.square(np.dot(np.transpose(w_n),Z)).real # element-wise square of the input to estimate the ith source
-    source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
-    source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
+    source_pred = np.square(np.dot(np.transpose(w_n),Z)).real # element-wise square of the input to estimate the ith source
+    #source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
+    #source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     # Step 4b:
     peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02)+1 ) # peaks variable holds the indices of all peaks
-    #source_pred /= np.mean(source_pred[:,np.argpartition(source_pred[:,peaks], -10)[-10:]]) 
+    print(peaks)
     if len(peaks) > 1:
 
         kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
@@ -347,16 +351,22 @@ def get_silohuette(w_n,Z,fsamp):
 
     # Step 4a: 
     source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
+    source_pred /= max(source_pred)
     source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     
     # Step 4b:
-    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02) ) # this is approx a value of 20, which is in time approx 10ms
+    peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02)+1 ) # this is approx a value of 20, which is in time approx 10ms
     if len(peaks) > 1:
 
         kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
         spikes_ind = np.argmax(kmeans.cluster_centers_)
         spikes = peaks[np.where(kmeans.labels_ == spikes_ind)]
-        sil = sklearn.metrics.silhouette_score(source_pred[peaks].reshape(-1,1), kmeans.labels_, metric='euclidean')
+        #sil1 = sklearn.metrics.silhouette_score(source_pred[peaks].reshape(-1,1), kmeans.labels_, metric='euclidean')
+        #sil = (sil1[kmeans.labels_ == 1].mean() + sil1[kmeans.labels_ == 2].mean()) / 2
+        silhouette_values = silhouette_samples(source_pred[peaks].reshape(-1,1), kmeans.labels_, metric='euclidean')
+        mean_silhouette_score_cluster1 = silhouette_values[kmeans.labels_ == 0].mean()
+        mean_silhouette_score_cluster2 = silhouette_values[kmeans.labels_ == 1].mean()
+        sil = (mean_silhouette_score_cluster1 + mean_silhouette_score_cluster2) / 2  
     else:
 
         sil = 0
