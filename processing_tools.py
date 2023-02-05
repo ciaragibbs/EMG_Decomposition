@@ -188,12 +188,6 @@ def whiten_emg(signal):
 
 
 
-
-
-
-
-
-
 ###################################### DECOMPOSITION TOOLS ##################################################################
 @numba.njit
 def square(x):
@@ -278,9 +272,6 @@ def fixed_point_alg(w_n, B, Z,cf, dot_cf, its = 500):
         wTZ = w_n_1.T @ Z 
         A = dot_cf(wTZ).mean()
         w_n = Z @ cf(wTZ).T / Z_meaner  - A * w_n_1
-        #w_n = np_mean(Z * cf(wTZ), axis = 1) - A * w_n_1
-        #print(np.allclose(w_n,other_w_n))
-
         # orthogonalise separation vectors
         w_n -= np.dot(B_T_B, w_n)
         # normalise separation vectors
@@ -304,7 +295,6 @@ def get_spikes(w_n,Z,fsamp):
     #source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     # Step 4b:
     peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02)+1 ) # peaks variable holds the indices of all peaks
-    print(peaks)
     if len(peaks) > 1:
 
         kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
@@ -384,11 +374,20 @@ def peel_off(Z,spikes,fsamp):
     for i in range(np.shape(Z)[0]): # iterating through the (extended) channels
         temp = cutMUAP(spikes,windowl,Z[i,:])
         waveform = np.mean(temp,axis=0)
-        EMGtemp[i,:] =  np.convolve(firings, waveform, "same")
+        EMGtemp[i,:] =  scipy.signal.convolve(firings, waveform, mode = 'same',method='auto')
 
     Z -= EMGtemp; # removing the EMG representation of the source spearation vector from the signal, avoid picking up replicate content in future iterations
     return Z
 ############################## POST PROCESSING #####################################################
+
+
+def gausswin(M, alpha=2.5):
+    
+    """ Python equivalent of the in-built gausswin function MATLAB (since there is no open-source Python equivalent) """
+    
+    n = np.arange(-(M-1) / 2, (M-1) / 2 + 1,dtype=np.float128)
+    w = np.exp((-1/2) * (alpha * n / ((M-1) / 2)) ** 2)
+    return w
 
 def cutMUAP(MUPulses, length, Y):
 
@@ -406,7 +405,7 @@ def cutMUAP(MUPulses, length, Y):
 
     c = len(MUPulses)
     edge_len = round(length / 2)
-    tmp = scipy.signal.windows.gaussian(2 * edge_len, std=edge_len / 3)
+    tmp = gausswin(2 * edge_len) # gives the same output as the in-built gausswin function in MATLAB
     # create the filtering window 
     win = np.ones(2 * length + 1)
     win[:edge_len] = tmp[:edge_len]
