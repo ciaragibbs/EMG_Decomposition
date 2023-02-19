@@ -71,13 +71,22 @@ def notch_filter(signal,fsamp,to_han = False):
 
    
 
-def bandpass_filter(signal,fsamp, order = 2, lowfreq = 20, highfreq = 500):
+def bandpass_filter(signal,fsamp, emg_type = 'surface'):
 
     """ Generic band-pass filter implementation and application to EMG signal  - assuming that you will iterate this function over each grid """
 
     """IMPORTANT!!! There is a difference in the default padding length between Python and MATLAB. For MATLAB -> 3*(max(len(a), len(b)) - 1),
     for Python scipy -> 3*max(len(a), len(b)). So I manually adjusted the Python filtfilt to pad by the same amount as in MATLAB, if you don't the results will not match across
     lanugages. """   
+
+    if emg_type == 0:
+        lowfreq = 20
+        highfreq = 500
+        order = 2
+    elif emg_type == 1:
+        lowfreq = 100
+        highfreq = 4400
+        order = 3
 
     # get the coefficients for the bandpass filter
     nyq = fsamp/2
@@ -178,8 +187,7 @@ def whiten_emg(signal):
     evectors = evectors[:,evalues > hard_limit]
     evalues = evalues[evalues>hard_limit]
     diag_mat = np.diag(evalues)
-    # np.dot is faster than @, since it's derived from C-language
-    # np.linalg.solve can be faster than np.linalg.inv
+    # CHECK:np.linalg.solve can be faster than np.linalg.inv -> DONE: no difference here
     whitening_mat = evectors @ np.linalg.inv(np.sqrt(diag_mat)) @ np.transpose(evectors)
     dewhitening_mat = evectors @ np.sqrt(diag_mat) @ np.transpose(evectors)
     whitened_emg =  np.matmul(whitening_mat, signal).real 
@@ -189,6 +197,26 @@ def whiten_emg(signal):
 
 
 ###################################### DECOMPOSITION TOOLS ##################################################################
+
+# orthogonalisation update on 5th feb 20:24
+@numba.njit(fastmath = True)
+def ortho_gram_schmidt(w,B):
+
+    """ This is the recommended method of orthogonalisation in Negro et.al 2016,
+    documented in Hyvärinen et.al 2000 (fast ICA) """
+    basis_projection = np.zeros(np.shape(w))
+    for i in range(B.shape[1]):
+        w_history = B[:, i]
+        if np.all(w_history == 0):
+            continue
+        # Estimate the independent components one by one. When we have estimated p independent components, 
+        # or p vectors w1; ...; wp; we run the one-unit fixed- point algorithm for wp11; 
+        # and after every iteration step subtract from wp11 the “projections”  of the previously estimated p vectors, and then
+        # renormalize 
+        basis_projection = basis_projection + np.divide(np.dot(w, w_history),np.dot(w_history,w_history)) * w_history
+    w = w - basis_projection
+    return w
+
 @numba.njit
 def square(x):
     return np.square(x)
@@ -220,28 +248,10 @@ def dot_exp(x):
 @numba.njit
 def dot_logcosh(x):
     return np.tanh(x)
-"""
-@numba.njit(fastmath=True)
-def np_apply_along_axis(func1d, axis, arr):
-  assert arr.ndim == 2
-  assert axis in [0, 1]
-  if axis == 0:
-    result = np.empty(arr.shape[1])
-    for i in range(len(result)):
-      result[i] = func1d(arr[:, i])
-  else:
-    result = np.empty(arr.shape[0])
-    for i in range(len(result)):
-      result[i] = func1d(arr[i, :])
-  return result
-
-@numba.njit
-def np_mean(array, axis):
-  return np_apply_along_axis(np.mean, axis, array)"""
 
 
 @numba.njit(fastmath=True)
-def fixed_point_alg(w_n, B, Z,cf, dot_cf, its = 500):
+def fixed_point_alg(w_n, B, Z,cf, dot_cf, its = 500,ortho_type='ord_deflation'):
 
     """ Update function for source separation vectors. The code user can select their preferred contrast function using a string input:
     1) square --> x^2
@@ -272,8 +282,14 @@ def fixed_point_alg(w_n, B, Z,cf, dot_cf, its = 500):
         wTZ = w_n_1.T @ Z 
         A = dot_cf(wTZ).mean()
         w_n = Z @ cf(wTZ).T / Z_meaner  - A * w_n_1
+
         # orthogonalise separation vectors
-        w_n -= np.dot(B_T_B, w_n)
+        if ortho_type == 'ord_deflation':
+            w_n -= np.dot(B_T_B, w_n)
+        elif ortho_type == 'gram_schmidt':
+            # as recommended in Negro et.al 2016
+            w_n = ortho_gram_schmidt(w_n,B)
+
         # normalise separation vectors
         w_n /= np.linalg.norm(w_n)
         counter += 1
@@ -281,32 +297,31 @@ def fixed_point_alg(w_n, B, Z,cf, dot_cf, its = 500):
 
     return w_n
 
-
-
-
-def get_spikes(w_n,Z,fsamp):
+# updadted get spikes on feb 19th 11:26am
+def get_spikes(w_n,Z, fsamp=2048, std_thr = 3):
 
     """ Based on gradient convolutive kernel compensation. Aim to remove spurious discharges to improve the source separation
     vector estimate. Results in a reduction in ISI vairability (by seeking to minimise the covariation in MU discharges)"""
 
     # Step 4a: 
-    source_pred = np.square(np.dot(np.transpose(w_n),Z)).real # element-wise square of the input to estimate the ith source
-    #source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
-    #source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
+    source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
+    source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     # Step 4b:
     peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02)+1 ) # peaks variable holds the indices of all peaks
+    source_pred /=  np.mean(maxk(source_pred[peaks], 10))
+    
     if len(peaks) > 1:
 
         kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
         spikes_ind = np.argmax(kmeans.cluster_centers_)
         spikes = peaks[np.where(kmeans.labels_ == spikes_ind)]
-        #print(np.shape(spikes))
         # remove outliers from the spikes cluster with a std-based threshold
-        #spikes = spikes[source_pred[:,spikes] < np.mean(source_pred[:,spikes],axis=1) +3*np.std(source_pred[spikes],axis=1)]
+        spikes = spikes[source_pred[spikes] <= np.mean(source_pred[spikes]) + std_thr*np.std(source_pred[spikes])]
     else:
         spikes = peaks
 
     return source_pred, spikes
+
 
 def min_cov_isi(w_n,B,Z,fsamp,cov_n,spikes_n): 
     
@@ -337,31 +352,45 @@ def min_cov_isi(w_n,B,Z,fsamp,cov_n,spikes_n):
 
 ################################ VALIDATION TOOLS ########################################
 
+# updated silohuette measure on feb 5th 18:20pm
+
+def maxk(signal, k):
+    return np.partition(signal, -k, axis=-1)[..., -k:]
+
 def get_silohuette(w_n,Z,fsamp):
 
     # Step 4a: 
     source_pred = np.dot(np.transpose(w_n), Z).real # element-wise square of the input to estimate the ith source
-    source_pred /= max(source_pred)
     source_pred = np.multiply(source_pred,abs(source_pred)) # keep the negatives 
     
     # Step 4b:
     peaks, _ = scipy.signal.find_peaks(np.squeeze(source_pred), distance = np.round(fsamp*0.02)+1 ) # this is approx a value of 20, which is in time approx 10ms
+    source_pred /=  np.mean(maxk(source_pred[peaks], 10))
     if len(peaks) > 1:
 
-        kmeans = KMeans(n_clusters = 2, init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
+        kmeans = KMeans(n_clusters = 2,init = 'k-means++',n_init = 1).fit(source_pred[peaks].reshape(-1,1)) # two classes: 1) spikes 2) noise
+        # indices of the spike and noise clusters (the spike cluster should have a larger value)
         spikes_ind = np.argmax(kmeans.cluster_centers_)
+        print()
+        noise_ind = np.argmin(kmeans.cluster_centers_)
+        # get the points that correspond to each of these clusters
         spikes = peaks[np.where(kmeans.labels_ == spikes_ind)]
-        #sil1 = sklearn.metrics.silhouette_score(source_pred[peaks].reshape(-1,1), kmeans.labels_, metric='euclidean')
-        #sil = (sil1[kmeans.labels_ == 1].mean() + sil1[kmeans.labels_ == 2].mean()) / 2
-        silhouette_values = silhouette_samples(source_pred[peaks].reshape(-1,1), kmeans.labels_, metric='euclidean')
-        mean_silhouette_score_cluster1 = silhouette_values[kmeans.labels_ == 0].mean()
-        mean_silhouette_score_cluster2 = silhouette_values[kmeans.labels_ == 1].mean()
-        sil = (mean_silhouette_score_cluster1 + mean_silhouette_score_cluster2) / 2  
+        noise = peaks[np.where(kmeans.labels_ == noise_ind)]
+        # calculate the centroids
+        spikes_centroid = kmeans.cluster_centers_[spikes_ind]
+        noise_centroid = kmeans.cluster_centers_[noise_ind]
+        # difference between the within-cluster sums of point-to-centroid distances for spikes (i.e. spikes spoints to spikes cluster centre)
+        intra_sums = (((source_pred[spikes]- spikes_centroid)**2).sum()) 
+        # difference between the between-cluster sums of point-to-centroid distance for spikes (i.e. spikes points to noise cluster centre)
+        inter_sums = (((source_pred[spikes] - noise_centroid)**2).sum())
+        sil = (inter_sums - intra_sums) / max(intra_sums, inter_sums)  
+
     else:
 
         sil = 0
 
     return source_pred, spikes, sil
+
 
 def peel_off(Z,spikes,fsamp):
 

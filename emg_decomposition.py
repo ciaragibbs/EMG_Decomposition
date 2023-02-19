@@ -9,12 +9,12 @@ from tkinter import simpledialog
 from scipy import signal
 import time
 root = tk.Tk()
-
+np.random.seed(1337)
 
 class EMG():
 
     def __init__(self):
-        self.its = 300 # number of iterations of the fixed point algorithm 
+        self.its = 50 # number of iterations of the fixed point algorithm 
         self.ref_exist = 1 # if ref_signal exist ref_exist = 1; if not ref_exist = 0 and manual selection of windows
         self.windows = 3  # number of segmented windows over each contraction
         self.check_emg = 1 # 0 = Automatic selection of EMG channels (remove 5% of channels) ; 1 = Visual checking
@@ -24,7 +24,8 @@ class EMG():
         self.sil_thr = 0.78 # Threshold for SIL values
         self.silthrpeeloff = 0.78 # Threshold for MU removed from the signal (if the sparse  deflation is on)
         self.ext_factor = 1000 # extension of observations for numerical stability 
-
+        self.edges2remove = 2
+        self.plat_thr = 0.8
 
 
 #######################################################################################################
@@ -34,9 +35,10 @@ class EMG():
 class offline_EMG(EMG):
 
     # child class of EMG, so will inherit it's initialisaiton
-    def __init__(self, save_dir):
+    def __init__(self, save_dir, to_filter):
         super().__init__()
-        self.save_dir = save_dir
+        self.save_dir = save_dir # directory at which final discharges will be saved
+        self.to_filter = to_filter # whether or not you notch and butter filter the signal, more relevant for matching real-time protocols
 
     
     def open_otb(self, inputfile):
@@ -125,7 +127,7 @@ class offline_EMG(EMG):
         r_map = []
 
         for i in range(self.signal_dict['ngrids']):
-            # print(grid_names[i])
+       
             if grid_names[i] == 'GR04MM1305':
 
                 ElChannelMap = [[0, 24, 25, 50, 51], 
@@ -144,6 +146,7 @@ class offline_EMG(EMG):
                 
                 rejected_channels = np.zeros([self.signal_dict['ngrids'],65])
                 IED = 4
+                self.emg_type = 0
 
             elif grid_names[i] == 'ELSCH064NM2':
 
@@ -163,6 +166,7 @@ class offline_EMG(EMG):
 
                 rejected_channels = np.zeros([self.signal_dict['ngrids'],65])
                 IED = 8
+                self.emg_type = 0
 
             elif grid_names[i] == 'GR08MM1305':
 
@@ -184,6 +188,7 @@ class offline_EMG(EMG):
                 
                 rejected_channels = np.zeros([self.signal_dict['ngrids'],65])
                 IED = 8
+                self.emg_type = 0
 
             elif grid_names[i] == 'GR10MM0808':
 
@@ -198,6 +203,7 @@ class offline_EMG(EMG):
 
                 rejected_channels = np.zeros([self.signal_dict['ngrids'],65])
                 IED = 10
+                self.emg_type = 0
 
             elif grid_names[i] == 'intraarrays':
                 
@@ -212,8 +218,9 @@ class offline_EMG(EMG):
                         [8, 18, 28, 38],
                         [9, 19, 29, 39]]
 
-                rejected_channels = np.zeros([self.signal_dict['ngrids'],40]);
+                rejected_channels = np.zeros([self.signal_dict['ngrids'],40])
                 IED = 1
+                self.emg_type = 1
             
             ElChannelMap = np.array(ElChannelMap)
             chans_per_grid = (np.shape(ElChannelMap)[0] * np.shape(ElChannelMap)[1]) - 1
@@ -232,7 +239,7 @@ class offline_EMG(EMG):
             # notch filtering
             self.signal_dict['filtered_data'][chans_per_grid*(grid-1):grid*chans_per_grid,:] = notch_filter(self.signal_dict['data'][chans_per_grid*(grid-1):grid*chans_per_grid,:],self.signal_dict['fsamp'])
             
-            self.signal_dict['filtered_data'][chans_per_grid*(grid-1):grid*chans_per_grid,:] = bandpass_filter(self.signal_dict['filtered_data'][chans_per_grid*(grid-1):grid*chans_per_grid,:],self.signal_dict['fsamp'])        
+            self.signal_dict['filtered_data'][chans_per_grid*(grid-1):grid*chans_per_grid,:] = bandpass_filter(self.signal_dict['filtered_data'][chans_per_grid*(grid-1):grid*chans_per_grid,:],self.signal_dict['fsamp'],emg_type = self.emg_type)        
 
         self.c_maps = c_map
         self.r_maps = r_map
@@ -279,7 +286,7 @@ class offline_EMG(EMG):
       
     def batch_w_target(self):
 
-        plateau = np.where(self.signal_dict['target'] == max(self.signal_dict['target']))[0] # finding where the plateau is
+        plateau = np.where(self.signal_dict['target'] >= max(self.signal_dict['target']))[0] * self.plat_thr # finding where the plateau is
         discontinuity = np.where(np.diff(plateau) > 1)[0]
         if self.windows > 1 and not discontinuity: 
         
@@ -346,11 +353,24 @@ class offline_EMG(EMG):
     def batch_wo_target(self):
 
         fake_ref = np.zeros([np.shape(self.signal_dict['data'])][1])
+        
+        # only looking at the first half of all EMG channel data
+        tmp = np.zeros(int(np.floor(np.shape(self.signal_dict['data'])[0]/2)), np.shape(self.signal_dict['data'])[1])
+        for i in range(np.shape(tmp)[0]):
+            tmp[i,:] =  moving_mean1d(abs(self.signal_dict['data'][i,:]),self.signal_dict['fsamp'])
+        
+        fake_ref = np.mean(tmp,axis=0)
+        signal['path'] = fake_ref
+        signal['target'] = fake_ref
         plt.figure(figsize=(10,8))
-        plt.plot(self.signal_dict['data'][0,:])
+        plt.plot(tmp.T, color = [0.5,0.5,0.5], linewidth = 0.5)
+        plt.plot(fake_ref,'k',linewidth=1)
+        plt.ylim([0, max(fake_ref)*1.5])
+        plt.title('EMG amplitude for first half of channel data')
         plt.grid()
         plt.show()
-        window_clicks = plt.ginput(2*self.windows, show_clicks = True)
+        tmp = None
+        window_clicks = plt.ginput(2*self.windows, show_clicks = True) # TO-DO: is the output of plt.ginput 1d?
         self.plateau_coords = np.zeros([1,self.windows *2])
         chans_per_grid = (self.r_maps[i] * self.c_maps[i]) - 1
         self.chans_per_grid = chans_per_grid
@@ -363,8 +383,6 @@ class offline_EMG(EMG):
             self.plateau_coords[interval*2] = np.floor(window_clicks[interval*2][0])
             self.plateau_coords[(interval+1)*2-1] = np.floor(window_clicks[(interval+1)*2-1][0])
         
-        
-
         for i in range(int(self.signal_dict['ngrids'])):
 
             grid = i + 1
@@ -377,8 +395,6 @@ class offline_EMG(EMG):
         
         self.signal_dict['batched_data'] = batched_data
 
-
-
   
 ################################ CONVOLUTIVE SPHERING ########################################
     def convul_sphering(self,g,interval,tracker):
@@ -386,8 +402,10 @@ class offline_EMG(EMG):
         """ 1) Filter the batched EMG data 2) Extend to improve speed of convergence/reduce numerical instability 3) Remove any DC component  4) Whiten """
         chans_per_grid = self.chans_per_grid
         grid = g+1
-        self.signal_dict['batched_data'][tracker]= notch_filter(self.signal_dict['batched_data'][tracker],self.signal_dict['fsamp'])
-        self.signal_dict['batched_data'][tracker] = bandpass_filter(self.signal_dict['batched_data'][tracker],self.signal_dict['fsamp'])  
+        if self.to_filter: # adding since will need to avoid this step if doing real-time decomposition + biofeedback
+
+            self.signal_dict['batched_data'][tracker]= notch_filter(self.signal_dict['batched_data'][tracker],self.signal_dict['fsamp'])
+            self.signal_dict['batched_data'][tracker] = bandpass_filter(self.signal_dict['batched_data'][tracker],self.signal_dict['fsamp'],emg_type = self.emg_type)  
 
         # differentiation - typical EMG generation model treats low amplitude spikes/MUs as noise, which is common across channels so can be cancelled with a first order difference. Useful for high intensities - where cross talk has biggest impact.
         if self.differential_mode:
@@ -402,7 +420,7 @@ class offline_EMG(EMG):
       
         self.signal_dict['extend_obvs_old'][interval] = extend_emg(self.signal_dict['extend_obvs_old'][interval], self.signal_dict['batched_data'][tracker], extension_factor)
         self.signal_dict['sq_extend_obvs'][interval] = (self.signal_dict['extend_obvs_old'][interval] @ self.signal_dict['extend_obvs_old'][interval].T) / np.shape(self.signal_dict['extend_obvs_old'][interval])[1]
-        self.signal_dict['inv_extend_obvs'][interval] = np.linalg.pinv(self.signal_dict['sq_extend_obvs'][interval])
+        self.signal_dict['inv_extend_obvs'][interval] = np.linalg.pinv(self.signal_dict['sq_extend_obvs'][interval]) # different method of pinv in MATLAB --> SVD vs QR
         
         # de-mean the extended emg observation matrix
         self.signal_dict['extend_obvs_old'][interval] = scipy.signal.detrend(self.signal_dict['extend_obvs_old'][interval], axis=- 1, type='constant', bp=0)
@@ -411,24 +429,25 @@ class offline_EMG(EMG):
         self.decomp_dict['whitened_obvs_old'][interval],self.decomp_dict['whiten_mat'][interval], self.decomp_dict['dewhiten_mat'][interval] = whiten_emg(self.signal_dict['extend_obvs_old'][interval])
         
         # remove the edges
-        self.signal_dict['extend_obvs'][interval] = self.signal_dict['extend_obvs_old'][interval][:,int(np.round(self.signal_dict['fsamp']*0.5)-1):-int(np.round(self.signal_dict['fsamp']*0.5))]
-        self.decomp_dict['whitened_obvs'][interval] = self.decomp_dict['whitened_obvs_old'][interval][:,int(np.round(self.signal_dict['fsamp']*0.5)-1):-int(np.round(self.signal_dict['fsamp']*0.5))]
+        self.signal_dict['extend_obvs'][interval] = self.signal_dict['extend_obvs_old'][interval][:,int(np.round(self.signal_dict['fsamp']*self.edges2remove)-1):-int(np.round(self.signal_dict['fsamp']*self.edges2remove))]
+        self.decomp_dict['whitened_obvs'][interval] = self.decomp_dict['whitened_obvs_old'][interval][:,int(np.round(self.signal_dict['fsamp']*self.edges2remove)-1):-int(np.round(self.signal_dict['fsamp']*self.edges2remove))]
         
         if g == 0: # don't need to repeat for every grid, since the path and target info (informing the batches), is the same for all grids
-            self.plateau_coords[interval*2] = self.plateau_coords[interval*2]  + int(np.round(self.signal_dict['fsamp']*0.5)) - 1
-            self.plateau_coords[(interval+1)*2 - 1] = self.plateau_coords[(interval+1)*2-1]  - int(np.round(self.signal_dict['fsamp']*0.5))
+            self.plateau_coords[interval*2] = self.plateau_coords[interval*2]  + int(np.round(self.signal_dict['fsamp']*self.edges2remove)) - 1
+            self.plateau_coords[(interval+1)*2 - 1] = self.plateau_coords[(interval+1)*2-1]  - int(np.round(self.signal_dict['fsamp']*self.edges2remove))
 
         print('Signal extension and whitening complete')
         
 ######################### FAST ICA AND CONVOLUTIVE KERNEL COMPENSATION  ############################################
 
-    def fast_ICA_and_CKC(self,g,interval,tracker,cf_type = 'logcosh'):
+    def fast_ICA_and_CKC(self,g,interval,tracker,cf_type = 'square',ortho_type = 'ord_deflation'):
 
         
         init_its = np.zeros([self.its],dtype=int) # tracker of initialisaitons of separation vectors across iterations
         fpa_its = 500 # maximum number of iterations for the fixed point algorithm
         # identify the time instant at which the maximum of the squared summation of all whitened extended observation vectors
         # occurs. Then, project vector is initialised to the whitened observation vector, at this located time instant.
+       
         Z = np.array(self.decomp_dict['whitened_obvs'][interval]).copy()
         sort_sq_sum_Z = np.argsort(np.square(np.sum(Z, axis = 0)))
         time_axis = np.linspace(0,np.shape(Z)[1],np.shape(Z)[1])/self.signal_dict['fsamp']  # create a time axis for spiking activity
@@ -447,22 +466,32 @@ class offline_EMG(EMG):
             cf = logcosh
             dot_cf = dot_logcosh
       
+
+        temp_MU_filters = np.zeros([np.shape(self.decomp_dict['whitened_obvs'][interval])[0],self.its])
+
         for i in range(self.its):
 
                 #################### FIXED POINT ALGORITHM #################################
                 init_its[i] = sort_sq_sum_Z[-(i+1)] # since the indexing starts at -1 the other way (for ascending order list)
                 self.decomp_dict['w_sep_vect'] = Z[:,int(init_its[i])].copy() # retrieve the corresponding signal value to initialise the separation vector
+                
                 # orthogonalise separation vector before fixed point algorithm
-                self.decomp_dict['w_sep_vect'] -= np.dot(np.matmul(self.decomp_dict['B_sep_mat'],np.transpose(self.decomp_dict['B_sep_mat'])),self.decomp_dict['w_sep_vect'])
+                if ortho_type == 'ord_deflation':
+                    self.decomp_dict['w_sep_vect'] -= np.dot(self.decomp_dict['B_sep_mat'] @ self.decomp_dict['B_sep_mat'].T, self.decomp_dict['w_sep_vect'])
+                elif ortho_type == 'gram_schmidt':
+                    self.decomp_dict['w_sep_vect'] = ortho_gram_schmidt(self.decomp_dict['w_sep_vect'],self.decomp_dict['B_sep_mat'])
+             
                 # normalise separation vector before fixed point algorithm 
                 self.decomp_dict['w_sep_vect'] /= np.linalg.norm(self.decomp_dict['w_sep_vect'])
             
                 # use the fixed point algorithm to identify consecutive separation vectors
-                self.decomp_dict['w_sep_vect'] = fixed_point_alg(self.decomp_dict['w_sep_vect'],self.decomp_dict['B_sep_mat'],Z, cf, dot_cf,fpa_its)
+                self.decomp_dict['w_sep_vect'] = fixed_point_alg(self.decomp_dict['w_sep_vect'],self.decomp_dict['B_sep_mat'],Z, cf, dot_cf,fpa_its,ortho_type)
+                
+                # get the first iteration of spikes using k means ++
                 fICA_source, spikes = get_spikes(self.decomp_dict['w_sep_vect'],Z, self.signal_dict['fsamp'])
             
                 ################# MINIMISATION OF COV OF DISCHARGES ############################
-                if len(spikes) > 10:
+                if len(spikes) > 1:
 
                     # determine the interspike interval
                     ISI = np.diff(spikes/self.signal_dict['fsamp'])
@@ -471,15 +500,16 @@ class offline_EMG(EMG):
                     # update the sepearation vector by summing all the spikes
                     w_n_p1 = np.sum(Z[:,spikes],axis=1) # summing the spiking across time, leaving an array that is channels x 1 
                     # minimisation of covariance of interspike intervals
-                    self.decomp_dict['MU_filters'][interval][:,i], spikes = min_cov_isi(w_n_p1,self.decomp_dict['B_sep_mat'],Z, self.signal_dict['fsamp'],CoV,spikes)
+                    temp_MU_filters[:,i], spikes = min_cov_isi(w_n_p1,self.decomp_dict['B_sep_mat'],Z, self.signal_dict['fsamp'],CoV,spikes)
+                
                     self.decomp_dict['B_sep_mat'][:,i] = (self.decomp_dict['w_sep_vect']).real # no need to shallow copy here
 
                     # calculate SIL
-                    fICA_source, spikes, self.decomp_dict['SILs'][interval,i] = get_silohuette(self.decomp_dict['MU_filters'][interval][:,i],Z,self.signal_dict['fsamp'])
+                    fICA_source, spikes, self.decomp_dict['SILs'][interval,i] = get_silohuette(temp_MU_filters[:,i],Z,self.signal_dict['fsamp'])
                     # peel off
                     if self.peel_off == 1 and self.decomp_dict['SILs'][interval,i] > self.sil_thr:
                         Z = peel_off(Z, spikes, self.signal_dict['fsamp'])
-            
+
                     if self.drawing_mode == 1:
                         plt.clf()
                         plt.ion()
@@ -503,32 +533,18 @@ class offline_EMG(EMG):
                     # without enough spikes, we skip minimising the covariation of discharges to improve the separation vector
                     self.decomp_dict['B_sep_mat'][:,i] = self.decomp_dict['w_sep_vect'].real  # no need to shallow copy here
 
-        # remove the MU filters that fall below the imposed SIL threshold
-        self.decomp_dict['MU_filters'][interval][:,self.decomp_dict['SILs'][interval,:] < self.self.sil_thr] =[]
+                print('Grid #{} - Iteration #{} - Sil = {}'.format(g, i, self.decomp_dict['SILs'][interval,i]))
+                
+        # keep the MU filters that had associated SIL values equal or greater than the imposed SIL threshold
+        self.decomp_dict['MU_filters'][interval] = temp_MU_filters[:,self.decomp_dict['SILs'][interval,:] >= self.sil_thr]
 
-
-
-
-
-"""
     def post_process_EMG():
 
+        print('To be completed')
         # batch processing over each window
-        pulse_trains, discharge_times = batch_process_filters(dewhit_mat, mu_filters,inv_extend_obvs,extend_obvs,plateau,exfactor,diff,orig_sig_size,fsamp)
+        #pulse_trains, discharge_times = batch_process_filters(dewhit_mat, mu_filters,inv_extend_obvs,extend_obvs,plateau,exfactor,diff,orig_sig_size,fsamp)
 
-        # removing duplicates
-        pulse_trains, new_discharge_times = remove_duplicates(PulseT, distime, signalprocess.exFactor, 0.3);
-
-        # rremoving outliers generating irrelvant discharge rates before manual edition (1st time)
-        new_discharge_times = remove_outliers(PulseT, distimenew, signal.fsamp);
-
-        # re evaluate all unique MUs over the course of the contraction
-        [signal.Pulsetrain{i}, distimenew] = refine_mus(signal.data(i*64-63:i*64,:), signal.EMGmask{i}, PulseT, distimenew);
-
-        # removing outliers generating irrelvatn discharge rates before manual edition (2nd time)
-        new_discharge_times = remove_outliers(signal.Pulsetrain{i}, distimenew, signal.fsamp);
-            
-"""
+        
 
 
 ########################################################################################################################  

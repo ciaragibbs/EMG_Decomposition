@@ -1,9 +1,9 @@
 
-from emg_decomposition_off import EMG, preprocess_EMG
+from emg_decomposition import EMG, offline_EMG
 import glob, os
 import numpy as np
 
-emg_obj = preprocess_EMG('/Users/cfg18/Documents/Decomposition Ciara Version/')
+emg_obj = offline_EMG('/Users/cfg18/Documents/Decomposition Ciara Version/',0)
 os.getcwd()
 all_files = glob.glob('./*.otb+')
 checkpoint = 1
@@ -36,25 +36,28 @@ for i in range(len(all_files)):
             extension_factor = int(np.round(emg_obj.ext_factor/np.shape(emg_obj.signal_dict['batched_data'][tracker])[0]))
             # these two arrays are holding extended emg data PRIOR to the removal of edges
             emg_obj.signal_dict['extend_obvs_old'] = np.zeros([nwins, np.shape(emg_obj.signal_dict['batched_data'][tracker])[0]*(extension_factor), np.shape(emg_obj.signal_dict['batched_data'][tracker])[1] + extension_factor -1 - emg_obj.differential_mode ])
-            emg_obj.decomp_dict['whitened_obvs_old'] = emg_obj.signal_dict['extend_obvs_old']
+            emg_obj.decomp_dict['whitened_obvs_old'] = emg_obj.signal_dict['extend_obvs_old'].copy()
             # these two arrays are the square and inverse of extneded emg data PRIOR to the removal of edges
             emg_obj.signal_dict['sq_extend_obvs'] = np.zeros([nwins,np.shape(emg_obj.signal_dict['batched_data'][tracker])[0]*(extension_factor),np.shape(emg_obj.signal_dict['batched_data'][tracker])[0]*(extension_factor)])
-            emg_obj.signal_dict['inv_extend_obvs'] = emg_obj.signal_dict['sq_extend_obvs'] 
+            emg_obj.signal_dict['inv_extend_obvs'] = emg_obj.signal_dict['sq_extend_obvs'].copy()
             # dewhitening matrix PRIOR to the removal of edges (no effect either way on matrix dimensions)
-            emg_obj.decomp_dict['dewhiten_mat'] = emg_obj.signal_dict['sq_extend_obvs']
+            emg_obj.decomp_dict['dewhiten_mat'] = emg_obj.signal_dict['sq_extend_obvs'].copy()
+            # whitening matrix PRIOR to the removal of edges (no effect either way on matrix dimensions)
+            emg_obj.decomp_dict['whiten_mat'] = emg_obj.signal_dict['sq_extend_obvs'].copy()
             # these two warrays are holding extended emg data AFTER the removal of edges
-            emg_obj.signal_dict['extend_obvs'] = emg_obj.signal_dict['extend_obvs_old'][:,:,int(np.round(emg_obj.signal_dict['fsamp']*0.5)-1):-int(np.round(emg_obj.signal_dict['fsamp']*0.5))]
-            emg_obj.decomp_dict['whitened_obvs'] = emg_obj.signal_dict['extend_obvs']
+            emg_obj.signal_dict['extend_obvs'] = emg_obj.signal_dict['extend_obvs_old'][:,:,int(np.round(emg_obj.signal_dict['fsamp']*emg_obj.edges2remove)-1):-int(np.round(emg_obj.signal_dict['fsamp']*emg_obj.edges2remove))].copy()
+            emg_obj.decomp_dict['whitened_obvs'] = emg_obj.signal_dict['extend_obvs'].copy()
 
             for interval in range (nwins): 
                 
                 # initialise zero arrays for separation matrix B and separation vectors w
                 emg_obj.decomp_dict['B_sep_mat'] = np.zeros([np.shape(emg_obj.decomp_dict['whitened_obvs'][interval])[0],emg_obj.its])
                 emg_obj.decomp_dict['w_sep_vect'] = np.zeros([np.shape(emg_obj.decomp_dict['whitened_obvs'][interval])[0],1])
-                emg_obj.decomp_dict['MU_filters'] = np.zeros([nwins,np.shape(emg_obj.decomp_dict['whitened_obvs'][interval])[0],emg_obj.its])
+                # MU filters needs a pre-allocation with more flexibility, to delete parts later
+                emg_obj.decomp_dict['MU_filters'] = [None]*(nwins)
+                #np.zeros([nwins,np.shape(emg_obj.decomp_dict['whitened_obvs'][interval])[0],emg_obj.its])
                 emg_obj.decomp_dict['SILs'] = np.zeros([nwins,emg_obj.its])
-
-
+                
                 emg_obj.convul_sphering(g,interval,tracker)
                 
     #################### FAST ICA ########################################
