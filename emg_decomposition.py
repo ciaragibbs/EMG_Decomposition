@@ -14,18 +14,28 @@ np.random.seed(1337)
 class EMG():
 
     def __init__(self):
+
+        # pre and during processing
         self.its = 50 # number of iterations of the fixed point algorithm 
-        self.ref_exist = 1 # if ref_signal exist ref_exist = 1; if not ref_exist = 0 and manual selection of windows
+        self.ref_exist = 1 # Boolean for whether an existing reference is used for signal batching (otherwise, manual selection)
         self.windows = 3  # number of segmented windows over each contraction
-        self.check_emg = 1 # 0 = Automatic selection of EMG channels (remove 5% of channels) ; 1 = Visual checking
+        self.check_emg = 1 # Boolean for the review process of EMG channels, where 0 = Automatic selection 1 = Visual checking
         self.drawing_mode = 1 # 0 = Output in the command window ; 1 = Output in a figure
         self.differential_mode = 0 # 0 = no; 1 = yes (filter out the smallest MU, can improve decomposition at the highest intensities
-        self.peel_off = 1 # 0 = no; 1 = yes (update the residual EMG by removing the motor units with the highest SIL value
-        self.sil_thr = 0.78 # Threshold for SIL values
-        self.silthrpeeloff = 0.78 # Threshold for MU removed from the signal (if the sparse  deflation is on)
+        self.peel_off = 1 # Boolean to determine whether we will update the residual EMG by removing the motor units with the highest SIL value
+        self.peeloffwin = 0.025 # Duraiton of windows for checking for MUAPs in the EMG signal
+        self.cov_filter = 0 # if we want to threshold the MU filters based on CoV also
+        self.cov_thr = 0.5 # Threshold for CoV of ISI values
+        self.sil_thr = 0.9 # Threshold for SIL values (matching Negro et.al 2016)
+        self.silthrpeeloff = 0.9 # Threshold for MU removed from the signal (if the sparse  deflation is on)
         self.ext_factor = 1000 # extension of observations for numerical stability 
-        self.edges2remove = 2
-        self.plat_thr = 0.8
+        self.edges2remove = 2 # trimming the batched data, to remove the effects of spectral leakage
+        self.plat_thr = 0.8 # giving some padding about the segmentation of the plateau region, if used
+        # post processing
+        self.alignMUAP = 0 # Boolean to determine whether we will realign the discharge times with the peak of MUAPs (channel with the MUAP with the highest p2p amplitudes, from double diff EMG signal)
+        self.refineMU = 0 # Boolean to determine whether we refine MUs, involve 1) removing outliers (1st time), 2) revaluating the MU pulse trains
+        self.dup_thr = 0.3 # Threshold that defines the minimal percentage of common discharge times between duplicated motor units
+        self.cov_dr = 0.3 # Threshold that define the CoV of discharge that we aim to reach, if we refine the MUs (i.e. refineMU = 1)
 
 
 #######################################################################################################
@@ -37,8 +47,8 @@ class offline_EMG(EMG):
     # child class of EMG, so will inherit it's initialisaiton
     def __init__(self, save_dir, to_filter):
         super().__init__()
-        self.save_dir = save_dir # directory at which final discharges will be saved
-        self.to_filter = to_filter # whether or not you notch and butter filter the signal, more relevant for matching real-time protocols
+        self.save_dir = save_dir # Directory at which final discharges will be saved
+        self.to_filter = to_filter # Boolean to determine whether or not you notch and butter filter the signal, more relevant for matching real-time protocols
 
     
     def open_otb(self, inputfile):
@@ -259,10 +269,7 @@ class offline_EMG(EMG):
             chans_per_grid = (self.r_maps[i] * self.c_maps[i]) - 1
             sig2inspect = self.signal_dict['filtered_data'][chans_per_grid*(grid-1):grid*chans_per_grid,:]
 
-            
             for c in range(self.c_maps[i]):
-                
-                #plt.figure(figsize=(10,8))
                 for r in range(self.r_maps[i]):
 
                     num_chans2reject = []
@@ -282,6 +289,7 @@ class offline_EMG(EMG):
 
                     self.rejected_channels[i,num_chans2reject] =  1
         
+        # TO DO: remove the assumption of the top LHC channel needing to be rejected
         self.rejected_channels = self.rejected_channels[:,1:] # get rid of the irrelevant top LHC channel
       
     def batch_w_target(self):
@@ -446,7 +454,7 @@ class offline_EMG(EMG):
         init_its = np.zeros([self.its],dtype=int) # tracker of initialisaitons of separation vectors across iterations
         fpa_its = 500 # maximum number of iterations for the fixed point algorithm
         # identify the time instant at which the maximum of the squared summation of all whitened extended observation vectors
-        # occurs. Then, project vector is initialised to the whitened observation vector, at this located time instant.
+        # occurs. Then, projection vector is initialised to the whitened observation vector, at this located time instant.
        
         Z = np.array(self.decomp_dict['whitened_obvs'][interval]).copy()
         sort_sq_sum_Z = np.argsort(np.square(np.sum(Z, axis = 0)))
@@ -468,6 +476,7 @@ class offline_EMG(EMG):
       
 
         temp_MU_filters = np.zeros([np.shape(self.decomp_dict['whitened_obvs'][interval])[0],self.its])
+        temp_CoVs = np.zeros([self.its])
 
         for i in range(self.its):
 
@@ -496,11 +505,12 @@ class offline_EMG(EMG):
                     # determine the interspike interval
                     ISI = np.diff(spikes/self.signal_dict['fsamp'])
                     # determine the coefficient of variation
-                    CoV = np.std(ISI)/np.mean(ISI)
+                    temp_CoVs[i] = np.std(ISI)/np.mean(ISI)
+            
                     # update the sepearation vector by summing all the spikes
                     w_n_p1 = np.sum(Z[:,spikes],axis=1) # summing the spiking across time, leaving an array that is channels x 1 
                     # minimisation of covariance of interspike intervals
-                    temp_MU_filters[:,i], spikes = min_cov_isi(w_n_p1,self.decomp_dict['B_sep_mat'],Z, self.signal_dict['fsamp'],CoV,spikes)
+                    temp_MU_filters[:,i], spikes, temp_CoVs[i] = min_cov_isi(w_n_p1,self.decomp_dict['B_sep_mat'],Z, self.signal_dict['fsamp'],temp_CoVs[i],spikes)
                 
                     self.decomp_dict['B_sep_mat'][:,i] = (self.decomp_dict['w_sep_vect']).real # no need to shallow copy here
 
@@ -536,14 +546,47 @@ class offline_EMG(EMG):
                 print('Grid #{} - Iteration #{} - Sil = {}'.format(g, i, self.decomp_dict['SILs'][interval,i]))
                 
         # keep the MU filters that had associated SIL values equal or greater than the imposed SIL threshold
-        self.decomp_dict['MU_filters'][interval] = temp_MU_filters[:,self.decomp_dict['SILs'][interval,:] >= self.sil_thr]
+        temp_MU_filters = temp_MU_filters[:,self.decomp_dict['SILs'][interval,:] >= self.sil_thr]
+        if self.cov_filter:
+            
+            temp_CoVs = temp_CoVs[self.decomp_dict['SILs'][interval,:] >= self.sil_thr]
+            temp_MU_filters = temp_MU_filters[:,temp_CoVs <= self.cov_thr]
+        
+        self.decomp_dict['MU_filters'][interval] = temp_MU_filters
+        self.decomp_dict['COVs'][interval] = temp_CoVs
 
-    def post_process_EMG():
+        temp_MU_filters = None
+        temp_CoVs = None
 
-        print('To be completed')
+######################################## POST PROCESSING #####################################################
+
+    def post_process_EMG(self,g,tracker):
+        
         # batch processing over each window
-        #pulse_trains, discharge_times = batch_process_filters(dewhit_mat, mu_filters,inv_extend_obvs,extend_obvs,plateau,exfactor,diff,orig_sig_size,fsamp)
+        pulse_trains, discharge_times = batch_process_filters(self.decomp_dict['dewhiten_mat'], self.decomp_dict['MU_filters'],self.signal_dict['inv_extend_obvs'],self.signal_dict['extend_obvs'],plateau,self.ext_factor,self.differential_mode,np.shape(self.signal_dict['data'])[1],self.signal_dict['fsamp'])
+        
+        # realign the discharge times with the centre of the MUAP
+        if self.alignMUAP:
+            discharged_times_aligned = realign_spikes() # TO DO
+        else: 
+             discharge_times_aligned = discharge_times.copy()
 
+        # remove duplicate MU discharge trains
+        pulse_trains, discharge_times_new = remove_duplicates(pulse_trains, discharge_times, discharge_times_aligned, (self.signal_dict['fsamp']/40), 0.00025, self.dup_thr, self.signal_dict['fsamp'])
+
+        # if we want further automatic refinement of MUs, prior to manual edition
+        if self.refineMU: 
+
+            # Remove outliers generating irrelevant discharge rates before manual edition (1st time)
+            discharge_times_new = remove_outliers(pulse_trains, discharge_times_new, self.CoVDR, self.signal_dict['fsamp'])
+            # Re-evaluate all of the UNIQUE MUs over the contraction
+            # TO DO: adjust to have adding of length(signal.EMGmask{i}), :) --> generalises to cases where the upper left electrode is not excluded
+            self.decomp_dict['pulse_trains'][g], discharge_times_new = refine_mus(self.signal_dict['data'][self.chans_per_grid*(g):self.chans_per_grid*(g) + len(self.rejected_channels[g]),:], self.rejected_channels[g], pulse_trains, discharge_times_new, self.signal_dict['fsamp'])
+            
+            # Remove outliers generating irrelevant discharge rates before manual edition (2nd time)
+            discharge_times_new = remove_outliers(pulse_trains, discharge_times_new, self.CoVDR, self.signal_dict['fsamp'])
+        else:
+            self.decomp_dict['pulse_trains'][g] = pulse_trains
         
 
 
