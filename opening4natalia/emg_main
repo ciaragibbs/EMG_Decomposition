@@ -1,0 +1,15 @@
+from emg_decomposition import EMG, offline_EMG
+import glob, os
+import numpy as np
+
+emg_obj = offline_EMG('/Users/cfg18/Documents/Decomposition Ciara Version/',0)
+os.getcwd()
+all_files = glob.glob('./*.otb+')
+checkpoint = 1
+
+
+for i in range(len(all_files)):
+
+    ################## FILE ORGANISATION ################################
+
+    emg_obj.open_otb(all_files[i]) # adds signal_dict to the emg_obj
